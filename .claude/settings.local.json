@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(tasklist:*)",
+      "Bash(netstat:*)",
+      "Bash(curl:*)"
+    ]
+  }
+}

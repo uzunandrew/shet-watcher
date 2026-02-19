@@ -1,0 +1,57 @@
+{
+  "projects": [
+    {
+      "id": "dc8bee62",
+      "name": "213. Мосфильмовская 31А (Октябрь Групп)King&sana",
+      "sections": [
+        {
+          "id": "fe797472",
+          "name": "Монолит ПЧ",
+          "url": "https://docs.google.com/spreadsheets/d/1Ju6BwNrHVGAHxaAc-qm-fSBbSD4PKRpx-zkqOyEFA78/edit#gid=1706025746",
+          "range": "A4:C24, G4:Y24"
+        },
+        {
+          "id": "982b2f68",
+          "name": "Монолит НЧ",
+          "url": "https://docs.google.com/spreadsheets/d/1IpM_gJWROdCc29QEDf5agoT_aVgw7KzfIoNsQ409YxE/edit?gid=1706025746#gid=1706025746",
+          "range": "A4:C26, G4:T26"
+        },
+        {
+          "id": "61a4c972",
+          "name": "АР",
+          "url": "https://docs.google.com/spreadsheets/d/1VIVN6wiUkrQQHje_1PLFH508dUpdKNvNfWUKZmtGzzk/edit?gid=0#gid=0",
+          "range": "A4:C40, H4:T40"
+        },
+        {
+          "id": "9c361524",
+          "name": "ВИС",
+          "url": "https://docs.google.com/spreadsheets/d/1Ce6sDHldMRQ4gjAR1Q63fSkFbKjTQ1XtEmBrnEbHSGw/edit?gid=1988985370#gid=1988985370",
+          "range": "A7:C22, M7:AB22"
+        },
+        {
+          "id": "ca99ca69",
+          "name": "ЭОМ/СС",
+          "url": "https://docs.google.com/spreadsheets/d/1UGN6vrK-QFdoFi1vfcvjoltqSRs6V2WX0dGnPFUcnd8/edit?gid=0#gid=0",
+          "range": "A3:C40, J3:W40"
+        },
+        {
+          "id": "5578a2fd",
+          "name": "Остальные работы",
+          "url": "https://docs.google.com/spreadsheets/d/1QTgG3yuCEBbSH-8jl4yhKtlP3n3kv9gv66TuR08-Fjw/edit?gid=0#gid=0",
+          "range": "A3:C7, F3:L10"
+        },
+        {
+          "id": "f17a99cf",
+          "name": "Временные здания/ПОС/Шпунт",
+          "url": "https://docs.google.com/spreadsheets/d/1taN_jhVgpMuU7UiJ1bvFgCltcgkULkuXsg2Kk6_HiEo/edit?gid=0#gid=0",
+          "range": "B3:C18, F3:T18"
+        }
+      ]
+    },
+    {
+      "id": "ad55a115",
+      "name": "214. Alia (ASTERUS)",
+      "sections": []
+    }
+  ]
+}
