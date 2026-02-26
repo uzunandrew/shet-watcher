@@ -1,0 +1,16 @@
+# Credentials
+credentials.json
+voiceasstaibot-9c7dbe6d59a8.json
+sheets-watcher/credentials.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Data (local state)
+sheets-watcher/snapshot.json
+sheets-watcher/processed.json
+sheets-watcher/hidden_cols.json
+
+# IDE / Claude
+.claude/
