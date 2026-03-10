@@ -12,5 +12,17 @@ sheets-watcher/snapshot.json
 sheets-watcher/processed.json
 sheets-watcher/hidden_cols.json
 
+# Deploy (contains server info)
+sheets-watcher/deploy.bat
+
+# Build artifacts
+sheets-watcher/dist/
+
+# Cache
+sheets-watcher/cache.json
+sheets-watcher/changes.json
+sheets-watcher/last_check.json
+sheets-watcher/actualized.json
+
 # IDE / Claude
 .claude/

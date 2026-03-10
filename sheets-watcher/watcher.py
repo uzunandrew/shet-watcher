@@ -12,7 +12,12 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets.readonly",
 ]
 
-PROJECT_DIR = Path(__file__).parent
+# При сборке PyInstaller: данные рядом с .exe, не во временной папке
+if getattr(sys, 'frozen', False):
+    PROJECT_DIR = Path(sys.executable).parent
+else:
+    PROJECT_DIR = Path(__file__).parent
+
 CREDENTIALS_PATH = PROJECT_DIR / "credentials.json"
 SNAPSHOT_PATH = PROJECT_DIR / "snapshot.json"
 CONFIG_PATH = PROJECT_DIR / "config.json"

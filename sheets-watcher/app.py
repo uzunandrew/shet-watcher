@@ -1,6 +1,11 @@
 import json
+import os
 import re
+import sys
+import time
 import uuid
+import webbrowser
+import threading
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -13,10 +18,20 @@ from watcher import get_client, load_snapshot, save_snapshot
 
 app = Flask(__name__)
 
-PROJECT_DIR = Path(__file__).parent
+# При сборке PyInstaller: sys.executable указывает на .exe,
+# данные храним рядом с ним. При обычном запуске — рядом со скриптом.
+if getattr(sys, 'frozen', False):
+    PROJECT_DIR = Path(sys.executable).parent
+else:
+    PROJECT_DIR = Path(__file__).parent
+
 CONFIG_PATH = PROJECT_DIR / "config.json"
 PROCESSED_PATH = PROJECT_DIR / "processed.json"
 HIDDEN_COLS_PATH = PROJECT_DIR / "hidden_cols.json"
+CHANGES_PATH = PROJECT_DIR / "changes.json"
+CACHE_PATH = PROJECT_DIR / "cache.json"
+LAST_CHECK_PATH = PROJECT_DIR / "last_check.json"
+ACTUALIZED_PATH = PROJECT_DIR / "actualized.json"
 
 
 # --------------- helpers ---------------
@@ -47,6 +62,20 @@ def save_processed(data: dict) -> None:
     )
 
 
+def load_changes() -> dict:
+    """Загружает накопленные изменения {pid:sid: [addr1, addr2, ...]}."""
+    if CHANGES_PATH.exists():
+        return json.loads(CHANGES_PATH.read_text(encoding="utf-8"))
+    return {}
+
+
+def save_changes(data: dict) -> None:
+    CHANGES_PATH.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def load_config() -> dict:
     text = CONFIG_PATH.read_text(encoding="utf-8")
     return json.loads(text)
@@ -55,6 +84,40 @@ def load_config() -> dict:
 def save_config(cfg: dict) -> None:
     CONFIG_PATH.write_text(
         json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def load_actualized() -> dict:
+    """Загружает актуализированные ячейки {pid:sid: [addr1, addr2, ...]}."""
+    if ACTUALIZED_PATH.exists():
+        try:
+            return json.loads(ACTUALIZED_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_actualized(data: dict) -> None:
+    ACTUALIZED_PATH.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def load_last_check() -> dict:
+    """Загружает даты последней проверки {pid: "2026-02-24 06:00"}."""
+    if LAST_CHECK_PATH.exists():
+        try:
+            return json.loads(LAST_CHECK_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_last_check(data: dict) -> None:
+    LAST_CHECK_PATH.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
 
@@ -79,6 +142,17 @@ def parse_url(url: str) -> tuple[str | None, int | None]:
         if "gid" in frag:
             gid = int(frag["gid"][0])
     return sid, gid
+
+
+def _cell_in_range(cell, range_str: str) -> bool:
+    """Проверяет, попадает ли ячейка в заданный A1-диапазон (напр. 'A4:H24')."""
+    from gspread.utils import a1_to_rowcol
+    parts = range_str.split(':')
+    if len(parts) != 2:
+        return True
+    r1, c1 = a1_to_rowcol(parts[0])
+    r2, c2 = a1_to_rowcol(parts[1])
+    return r1 <= cell.row <= r2 and c1 <= cell.col <= c2
 
 
 def read_grid(client, spreadsheet_id, gid, range_str):
@@ -109,39 +183,42 @@ def read_grid(client, spreadsheet_id, gid, range_str):
         cell_map[(c.row, c.col)] = val
         flat[f"{spreadsheet_id}!{addr}"] = val
 
-    # Извлекаем гиперссылки через Sheets API v4
+    # Группируем ячейки по под-диапазонам для определения начала
+    range_cell_groups = {}
+    for rng in range_parts:
+        range_cell_groups[rng] = [c for c in all_cells if _cell_in_range(c, rng)]
+
+    # Извлекаем гиперссылки через Sheets API v4 (один batch-запрос)
     link_map: dict[tuple[int, int], str] = {}
     try:
-        # Для каждого под-диапазона делаем отдельный запрос
         http = spreadsheet.client
-        for rng in range_parts:
-            full_range = f"'{sheet_title}'!{rng}"
-            response = http.request(
-                'get',
-                f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}',
-                params={
-                    'ranges': full_range,
-                    'fields': 'sheets.data.rowData.values(hyperlink)',
-                },
-            )
-            data = response.json()
+        all_ranges = [f"'{sheet_title}'!{rng}" for rng in range_parts]
+        response = http.request(
+            'get',
+            f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}',
+            params={
+                'ranges': all_ranges,
+                'fields': 'sheets.data.rowData.values(hyperlink)',
+            },
+        )
+        data = response.json()
 
-            # Определяем начало этого под-диапазона
-            sub_cells = sheet.range(rng)
-            if not sub_cells:
-                continue
-            sub_min_row = min(c.row for c in sub_cells)
-            sub_min_col = min(c.col for c in sub_cells)
-
-            sheets_data = data.get('sheets', [])
-            if sheets_data:
-                grid_data = sheets_data[0].get('data', [])
-                if grid_data:
-                    for r_idx, row_data in enumerate(grid_data[0].get('rowData', [])):
-                        for c_idx, cell_data in enumerate(row_data.get('values', [])):
-                            hyperlink = cell_data.get('hyperlink')
-                            if hyperlink:
-                                link_map[(sub_min_row + r_idx, sub_min_col + c_idx)] = hyperlink
+        sheets_data = data.get('sheets', [])
+        if sheets_data:
+            grid_data_list = sheets_data[0].get('data', [])
+            for i, rng in enumerate(range_parts):
+                if i >= len(grid_data_list):
+                    break
+                sub_cells = range_cell_groups.get(rng, [])
+                if not sub_cells:
+                    continue
+                sub_min_row = min(c.row for c in sub_cells)
+                sub_min_col = min(c.col for c in sub_cells)
+                for r_idx, row_data in enumerate(grid_data_list[i].get('rowData', [])):
+                    for c_idx, cell_data in enumerate(row_data.get('values', [])):
+                        hyperlink = cell_data.get('hyperlink')
+                        if hyperlink:
+                            link_map[(sub_min_row + r_idx, sub_min_col + c_idx)] = hyperlink
     except Exception as exc:
         print(f"[DEBUG hyperlinks] API ошибка: {type(exc).__name__}: {exc}")
 
@@ -174,8 +251,21 @@ def read_grid(client, spreadsheet_id, gid, range_str):
     return sheet_title, col_headers, rows, flat
 
 
-# Кеш результатов по секциям (section_id → данные)
-section_cache: dict[str, dict] = {}
+# Кеш результатов по секциям — хранится в файле, доступен всем воркерам
+def load_section_cache() -> dict:
+    if CACHE_PATH.exists():
+        try:
+            return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_section_cache(data: dict) -> None:
+    CACHE_PATH.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 # --------------- routes ---------------
@@ -197,6 +287,7 @@ def empty():
         projects=cfg.get("projects", []),
         current=None,
         sections_data={},
+        last_check_date="",
     )
 
 
@@ -207,18 +298,34 @@ def project_view(pid):
     if not proj:
         return redirect(url_for("index"))
 
-    # Подгружаем hidden_cols для секций, которые уже в кеше
+    sc = load_section_cache()
+
+    # Подгружаем актуальные hidden_cols, processed и actualized для секций
     hidden = load_hidden_cols()
+    processed = load_processed()
+    all_changes = load_changes()
+    actualized = load_actualized()
     for sec in proj.get("sections", []):
-        if sec["id"] in section_cache:
-            hidden_key = f"{pid}:{sec['id']}"
-            section_cache[sec["id"]]["hidden_cols"] = hidden.get(hidden_key, [])
+        key = f"{pid}:{sec['id']}"
+        if sec["id"] in sc:
+            sc[sec["id"]]["hidden_cols"] = hidden.get(key, [])
+            sc[sec["id"]]["processed"] = processed.get(key, [])
+            sc[sec["id"]]["actualized"] = actualized.get(key, [])
+            # Восстанавливаем accumulated changes
+            saved_ch = all_changes.get(key, [])
+            if saved_ch and not sc[sec["id"]].get("changed"):
+                sc[sec["id"]]["changed"] = saved_ch
+                sc[sec["id"]]["total"] = len(saved_ch)
+
+    lc = load_last_check()
+    last_check_date = lc.get(pid, "")
 
     return render_template_string(
         HTML,
         projects=cfg.get("projects", []),
         current=proj,
-        sections_data=section_cache,
+        sections_data=sc,
+        last_check_date=last_check_date,
     )
 
 
@@ -230,6 +337,20 @@ def project_add():
     cfg = load_config()
     pid = uuid.uuid4().hex[:8]
     cfg["projects"].append({"id": pid, "name": name, "sections": []})
+    save_config(cfg)
+    return redirect(url_for("project_view", pid=pid))
+
+
+@app.route("/project/<pid>/rename", methods=["POST"])
+def project_rename(pid):
+    new_name = request.form.get("name", "").strip()
+    if not new_name:
+        return redirect(url_for("project_view", pid=pid))
+    cfg = load_config()
+    for p in cfg["projects"]:
+        if p["id"] == pid:
+            p["name"] = new_name
+            break
     save_config(cfg)
     return redirect(url_for("project_view", pid=pid))
 
@@ -302,31 +423,49 @@ def project_check(pid):
     first_run = not old_snapshot
     new_snapshot = dict(old_snapshot)
 
+    sc = load_section_cache()
+
     try:
         client = get_client()
     except Exception as e:
-        section_cache[f"_error_{pid}"] = {"error": str(e)}
+        sc[f"_error_{pid}"] = {"error": str(e)}
+        save_section_cache(sc)
         return redirect(url_for("project_view", pid=pid))
 
-    section_cache.pop(f"_error_{pid}", None)
+    sc.pop(f"_error_{pid}", None)
 
-    for sec in proj["sections"]:
+    all_changes = load_changes()
+
+    for idx, sec in enumerate(proj["sections"]):
+        if idx > 0:
+            time.sleep(3)  # задержка между разделами для API лимита
         try:
             sp_id, gid = parse_url(sec["url"])
             if not sp_id:
-                section_cache[sec["id"]] = {"error": "Невалидная ссылка"}
+                sc[sec["id"]] = {"error": "Невалидная ссылка"}
                 continue
 
             sheet_title, col_headers, rows, flat = read_grid(
                 client, sp_id, gid, sec["range"]
             )
 
-            changed = []
+            # Ключ для хранения накопленных изменений
+            changes_key = f"{pid}:{sec['id']}"
+            saved_changes = set(all_changes.get(changes_key, []))
+
+            # Находим новые изменения (сравниваем со snapshot)
             if not first_run:
                 for key, new_val in flat.items():
                     old_val = old_snapshot.get(key)
                     if old_val is not None and old_val != new_val:
-                        changed.append(key.split("!", 1)[1])
+                        addr = key.split("!", 1)[1]
+                        saved_changes.add(addr)
+
+            # Сохраняем накопленные изменения
+            all_changes[changes_key] = list(saved_changes)
+
+            # Список changed = все накопленные изменения
+            changed = list(saved_changes)
 
             new_snapshot.update(flat)
 
@@ -338,12 +477,16 @@ def project_check(pid):
             hidden_key = f"{pid}:{sec['id']}"
             hidden_list = hidden.get(hidden_key, [])
 
-            section_cache[sec["id"]] = {
+            act = load_actualized()
+            act_list = act.get(f"{pid}:{sec['id']}", [])
+
+            sc[sec["id"]] = {
                 "sheet_title": sheet_title,
                 "col_headers": col_headers,
                 "rows": rows,
                 "changed": changed,
                 "processed": proc_list,
+                "actualized": act_list,
                 "hidden_cols": hidden_list,
                 "total": len(changed),
                 "checked_at": datetime.now().strftime("%H:%M:%S"),
@@ -351,9 +494,17 @@ def project_check(pid):
                 "error": None,
             }
         except Exception as e:
-            section_cache[sec["id"]] = {"error": str(e)}
+            sc[sec["id"]] = {"error": str(e)}
 
+    save_changes(all_changes)
     save_snapshot(new_snapshot)
+    save_section_cache(sc)
+
+    # Сохраняем дату последней проверки
+    lc = load_last_check()
+    lc[pid] = datetime.now().strftime("%d.%m.%Y %H:%M")
+    save_last_check(lc)
+
     return redirect(url_for("project_view", pid=pid))
 
 
@@ -373,13 +524,44 @@ def mark_processed(pid, sid):
             processed[key].append(addr)
     save_processed(processed)
 
-    # Обновим section_cache: перенести ячейки из changed в processed
-    if sid in section_cache:
-        if "processed" not in section_cache[sid]:
-            section_cache[sid]["processed"] = []
+    # Обновим кеш: перенести ячейки из changed в processed
+    sc = load_section_cache()
+    if sid in sc:
+        if "processed" not in sc[sid]:
+            sc[sid]["processed"] = []
         for addr in cells:
-            if addr not in section_cache[sid]["processed"]:
-                section_cache[sid]["processed"].append(addr)
+            if addr not in sc[sid]["processed"]:
+                sc[sid]["processed"].append(addr)
+        save_section_cache(sc)
+
+    return jsonify(ok=True)
+
+
+@app.route("/project/<pid>/section/<sid>/mark-actualized", methods=["POST"])
+def mark_actualized(pid, sid):
+    data = request.get_json(force=True)
+    cells = data.get("cells", [])
+    if not cells:
+        return jsonify(ok=False)
+
+    actualized = load_actualized()
+    key = f"{pid}:{sid}"
+    if key not in actualized:
+        actualized[key] = []
+    for addr in cells:
+        if addr not in actualized[key]:
+            actualized[key].append(addr)
+    save_actualized(actualized)
+
+    # Обновим кеш
+    sc = load_section_cache()
+    if sid in sc:
+        if "actualized" not in sc[sid]:
+            sc[sid]["actualized"] = []
+        for addr in cells:
+            if addr not in sc[sid]["actualized"]:
+                sc[sid]["actualized"].append(addr)
+        save_section_cache(sc)
 
     return jsonify(ok=True)
 
@@ -400,8 +582,10 @@ def hide_cols(pid, sid):
             hidden[key].append(c)
     save_hidden_cols(hidden)
 
-    if sid in section_cache:
-        section_cache[sid]["hidden_cols"] = hidden[key]
+    sc = load_section_cache()
+    if sid in sc:
+        sc[sid]["hidden_cols"] = hidden[key]
+        save_section_cache(sc)
 
     return jsonify(ok=True)
 
@@ -420,8 +604,10 @@ def unhide_cols(pid, sid):
             hidden[key] = []
         save_hidden_cols(hidden)
 
-    if sid in section_cache:
-        section_cache[sid]["hidden_cols"] = hidden.get(key, [])
+    sc = load_section_cache()
+    if sid in sc:
+        sc[sid]["hidden_cols"] = hidden.get(key, [])
+        save_section_cache(sc)
 
     return jsonify(ok=True)
 
@@ -538,7 +724,25 @@ body {
     gap: 16px;
     margin-bottom: 24px;
 }
-.main-head h2 { font-size: 22px; color: #fff; }
+.main-head h2 { font-size: 22px; color: #fff; margin: 0; }
+.project-title { display: flex; align-items: center; gap: 8px; }
+.btn-rename {
+    background: none; border: none; color: #666; cursor: pointer;
+    font-size: 14px; padding: 2px 6px; transition: color 0.15s;
+}
+.btn-rename:hover { color: #7b68ee; }
+.rename-form { display: flex; align-items: center; gap: 8px; }
+.rename-input {
+    background: #1a1a35; border: 1px solid #2a2a5a; color: #fff;
+    padding: 6px 12px; border-radius: 6px; font-size: 16px; width: 300px;
+}
+.rename-input:focus { border-color: #7b68ee; outline: none; }
+.btn-small { padding: 5px 14px; font-size: 12px; }
+.last-check-info {
+    color: #90caf9;
+    font-size: 13px;
+    white-space: nowrap;
+}
 .btn {
     padding: 9px 22px;
     border: none;
@@ -631,7 +835,32 @@ body {
 .badge-ok { background: #0a3d2a; color: #4caf50; }
 .badge-changes { background: #3d0a0a; color: #ff6b6b; }
 .badge-first { background: #3d2e0a; color: #ff9800; }
+.badge-actual { background: #0a1a3d; color: #64b5f6; }
 .badge-time { background: #1a1a3a; color: #666; }
+.badge-processed-btn {
+    background: #2e7d32; color: #fff; border: none; cursor: pointer;
+    font-size: 11px; padding: 3px 10px; border-radius: 12px; font-weight: 600;
+    display: none; align-items: center; gap: 4px;
+    transition: background 0.15s;
+}
+.badge-processed-btn:hover { background: #388e3c; }
+.badge-processed-btn.visible { display: inline-flex; }
+.badge-actualized-btn {
+    background: #1565c0; color: #fff; border: none; cursor: pointer;
+    font-size: 11px; padding: 3px 10px; border-radius: 12px; font-weight: 600;
+    display: none; align-items: center; gap: 4px;
+    transition: background 0.15s;
+}
+.badge-actualized-btn:hover { background: #1976d2; }
+.badge-actualized-btn.visible { display: inline-flex; }
+.badge-cancel-btn {
+    background: #616161; color: #fff; border: none; cursor: pointer;
+    font-size: 11px; padding: 3px 10px; border-radius: 12px; font-weight: 600;
+    display: none; align-items: center; gap: 4px;
+    transition: background 0.15s;
+}
+.badge-cancel-btn:hover { background: #757575; }
+.badge-cancel-btn.visible { display: inline-flex; }
 
 .section-body { padding: 0; }
 
@@ -664,7 +893,8 @@ body {
 .grid {
     border-collapse: collapse;
     font-size: 13px;
-    width: 100%;
+    table-layout: fixed;
+    width: 0;
     border: 2px solid #2a2a5a;
 }
 .grid th {
@@ -676,7 +906,20 @@ body {
     font-weight: 700;
     text-transform: uppercase;
     border: 2px solid #2a2a5a;
+    position: relative;
+    min-width: 30px;
 }
+.grid th .resize-handle {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    width: 5px;
+    cursor: col-resize;
+    background: transparent;
+}
+.grid th .resize-handle:hover,
+.grid th .resize-handle.resizing { background: #7b68ee; }
 .grid .row-num {
     background: #12122a;
     color: #8899bb;
@@ -690,24 +933,53 @@ body {
 .grid td {
     padding: 8px 14px;
     border: 1px solid #2a2a5a;
-    max-width: 360px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 .grid tr:hover td:not(.row-num) { background: #1a1a40; }
 .grid td.has-link {
-    width: 30px;
-    max-width: 30px;
-    min-width: 30px;
-    text-align: center;
-    padding: 8px 4px;
-    overflow: hidden;
+    padding: 8px 6px;
 }
-.grid td.has-link a {
-    display: inline-block;
-    font-size: 14px;
+.grid td.has-link .cell-link-wrap {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+.grid td.has-link .cell-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.grid td.has-link .cell-link-icon {
+    flex-shrink: 0;
+    color: #7b9bff;
+    font-size: 13px;
     text-decoration: none;
+    opacity: 0.7;
+    transition: opacity 0.15s;
+}
+.grid td.has-link .cell-link-icon:hover {
+    opacity: 1;
+    text-decoration: underline;
+}
+/* Явная ширина первых столбцов */
+.grid th:first-child { width: 40px; }
+.grid th[data-col="A"] { width: 80px; }
+.grid th[data-col="B"] { width: 200px; }
+.grid th[data-col="C"] { width: 300px; }
+/* Узкие столбцы после C */
+.grid th.col-narrow { width: 30px; max-width: 50px; }
+.grid td.col-narrow {
+    max-width: 50px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 8px 4px;
+    text-align: center;
+    font-size: 11px;
 }
 .cell-changed {
     background: #3d0a0a !important;
@@ -732,6 +1004,14 @@ body {
     font-weight: 700;
     border-left: 4px solid #4caf50 !important;
 }
+.cell-actualized {
+    background: #0a1a3d !important;
+    color: #64b5f6 !important;
+    font-weight: 700;
+    border-left: 4px solid #42a5f5 !important;
+}
+.cell-linkable { cursor: pointer; }
+.cell-linkable:hover { background: rgba(66, 165, 245, 0.15); }
 
 /* ---- column selection & hiding ---- */
 .grid th.col-header {
@@ -813,6 +1093,7 @@ body {
 }
 .changes-bar .stat-num.red { color: #ff6b6b; }
 .changes-bar .stat-num.green { color: #4caf50; }
+.changes-bar .stat-num.blue { color: #64b5f6; }
 .changes-bar .stat-num.gray { color: #666; }
 .changes-bar .stat-label { color: #888; font-size: 12px; }
 .changes-bar .divider {
@@ -820,20 +1101,6 @@ body {
     height: 30px;
     background: #2a2a4a;
 }
-.btn-processed {
-    padding: 8px 18px;
-    background: #2e7d32;
-    color: #fff;
-    border: none;
-    border-radius: 6px;
-    font-size: 13px;
-    cursor: pointer;
-    transition: all 0.15s;
-    margin-left: auto;
-    display: none;
-}
-.btn-processed:hover { background: #388e3c; }
-.btn-processed.visible { display: inline-flex; align-items: center; gap: 6px; }
 
 /* ---- section edit form ---- */
 .sec-edit-btn {
@@ -882,28 +1149,6 @@ body {
 .sec-edit-form .ef-cancel { background: #2a2a4a; color: #aaa; }
 .sec-edit-form .ef-cancel:hover { background: #3a3a5a; }
 
-/* ---- floating processed button ---- */
-.floating-processed {
-    position: fixed;
-    bottom: 28px;
-    right: 32px;
-    padding: 12px 28px;
-    background: #2e7d32;
-    color: #fff;
-    border: none;
-    border-radius: 10px;
-    font-size: 15px;
-    font-weight: 600;
-    cursor: pointer;
-    box-shadow: 0 4px 20px rgba(46, 125, 50, 0.5);
-    transition: all 0.2s;
-    display: none;
-    align-items: center;
-    gap: 8px;
-    z-index: 100;
-}
-.floating-processed:hover { background: #388e3c; transform: translateY(-2px); }
-.floating-processed.visible { display: inline-flex; }
 
 /* ---- empty state ---- */
 .empty-state {
@@ -950,10 +1195,21 @@ body {
     </div>
 {% else %}
     <div class="main-head">
-        <h2>{{ current.name }}</h2>
-        <form method="POST" action="/project/{{ current.id }}/check">
-            <button class="btn btn-primary"
-                onclick="this.disabled=true; this.innerText='Загрузка...'; this.form.submit();">
+        <h2 class="project-title" id="projectTitle">
+            <span class="project-name" ondblclick="showRenameForm()">{{ current.name }}</span>
+            <button class="btn-rename" onclick="showRenameForm()" title="Переименовать">&#9998;</button>
+        </h2>
+        <form method="POST" action="/project/{{ current.id }}/rename" id="renameForm" class="rename-form" style="display:none">
+            <input name="name" value="{{ current.name }}" class="rename-input" required>
+            <button type="submit" class="btn btn-small btn-primary">OK</button>
+            <button type="button" class="btn btn-small" onclick="hideRenameForm()">Отмена</button>
+        </form>
+        {% if last_check_date %}
+        <span class="last-check-info">Дата обновления таблицы: <strong>{{ last_check_date }}</strong></span>
+        {% endif %}
+        <form method="POST" action="/project/{{ current.id }}/check" id="checkForm">
+            <button class="btn btn-primary" id="btnCheckAll" type="button"
+                onclick="confirmCheck(this)">
                 Проверить все
             </button>
         </form>
@@ -963,7 +1219,7 @@ body {
         </form>
     </div>
 
-    {% set ns = namespace(total_changed=0, total_processed=0) %}
+    {% set ns = namespace(total_changed=0, total_processed=0, total_actualized=0) %}
     {% for sec in current.sections %}
         {% set d = sections_data.get(sec.id, {}) %}
         {% if d.get('changed') %}
@@ -972,8 +1228,11 @@ body {
         {% if d.get('processed') %}
             {% set ns.total_processed = ns.total_processed + d.processed|length %}
         {% endif %}
+        {% if d.get('actualized') %}
+            {% set ns.total_actualized = ns.total_actualized + d.actualized|length %}
+        {% endif %}
     {% endfor %}
-    {% set unprocessed = ns.total_changed - ns.total_processed %}
+    {% set unprocessed = ns.total_changed - ns.total_processed - ns.total_actualized %}
 
     {% if ns.total_changed > 0 %}
     <div class="changes-bar" id="changesBar">
@@ -988,12 +1247,14 @@ body {
         </div>
         <div class="divider"></div>
         <div class="stat">
+            <span class="stat-num blue" id="actualizedCount">{{ ns.total_actualized }}</span>
+            <span class="stat-label">актуализировано</span>
+        </div>
+        <div class="divider"></div>
+        <div class="stat">
             <span class="stat-num gray">{{ ns.total_changed }}</span>
             <span class="stat-label">всего изменений</span>
         </div>
-        <button class="btn-processed" id="btnProcessed" onclick="markSelectedProcessed()">
-            &#10003; Отработано (<span id="selectedCount">0</span>)
-        </button>
     </div>
     {% endif %}
 
@@ -1031,6 +1292,7 @@ body {
     {% for sec in current.sections %}
     {% set data = sections_data.get(sec.id, {}) %}
     {% set proc = data.get('processed', []) %}
+    {% set act = data.get('actualized', []) %}
     {% set hidden_cols = data.get('hidden_cols', []) %}
     <div class="section-card" data-sid="{{ sec.id }}" data-pid="{{ current.id }}">
         <div class="section-header">
@@ -1040,12 +1302,18 @@ body {
             <span class="sec-meta">{{ sec.range }}</span>
             <button class="sec-edit-btn" onclick="toggleEditForm(this)" title="Редактировать">&#9998;</button>
             <div class="badges">
+                <button class="badge-processed-btn" data-sid="{{ sec.id }}"
+                    onclick="markSectionProcessed(this)">&#10003; Отработано (<span class="sec-sel-cnt">0</span>)</button>
+                <button class="badge-actualized-btn" data-sid="{{ sec.id }}"
+                    onclick="markSectionActualized(this)">&#9733; Актуально (<span class="sec-act-cnt">0</span>)</button>
+                <button class="badge-cancel-btn" data-sid="{{ sec.id }}"
+                    onclick="cancelSelection(this)">&#10005; Отмена (<span class="sec-cancel-cnt">0</span>)</button>
                 {% if data.get('error') %}
                     <span class="badge badge-changes">ошибка</span>
                 {% elif data.get('first_run') %}
                     <span class="badge badge-first">сохранено</span>
                 {% elif data.get('total', 0) > 0 %}
-                    {% set unproc = data.changed|reject('in', proc)|list|length %}
+                    {% set unproc = data.changed|reject('in', proc)|reject('in', act)|list|length %}
                     {% if unproc > 0 %}
                         <span class="badge badge-changes">{{ unproc }} изм.</span>
                     {% else %}
@@ -1053,6 +1321,9 @@ body {
                     {% endif %}
                     {% if proc|length > 0 %}
                         <span class="badge badge-ok">{{ proc|length }} отр.</span>
+                    {% endif %}
+                    {% if act|length > 0 %}
+                        <span class="badge badge-actual">{{ act|length }} акт.</span>
                     {% endif %}
                 {% elif data.get('checked_at') %}
                     <span class="badge badge-ok">OK</span>
@@ -1106,8 +1377,9 @@ body {
                         <tr>
                             <th></th>
                             {% for col in data.col_headers %}
-                            <th class="col-header {{ 'col-hidden' if col in hidden_cols else '' }}"
-                                data-col="{{ col }}" onclick="toggleColSelect(this)">{{ col }}</th>
+                            {% set is_narrow = col > 'C' and col != '' %}
+                            <th class="col-header{{ ' col-narrow' if is_narrow else '' }}{{ ' col-hidden' if col in hidden_cols else '' }}"
+                                data-col="{{ col }}" onclick="toggleColSelect(this)">{{ col }}<div class="resize-handle" onmousedown="startResize(event, this)"></div></th>
                             {% endfor %}
                         </tr>
                     </thead>
@@ -1118,25 +1390,36 @@ body {
                             {% for cell in row.cells %}
                             {% set col_letter = data.col_headers[loop.index0] %}
                             {% set is_col_hidden = col_letter in hidden_cols %}
-                            {% if cell.addr in data.changed and cell.addr in proc %}
-                            <td class="cell-processed{{ ' has-link' if cell.link else '' }}{{ ' col-hidden' if is_col_hidden else '' }}"
+                            {% set is_narrow = col_letter > 'C' and col_letter != '' %}
+                            {% if cell.addr in act %}
+                            <td class="cell-actualized{{ ' col-narrow' if is_narrow else '' }}{{ ' has-link' if cell.link else '' }}{{ ' col-hidden' if is_col_hidden else '' }}"
                                 data-col="{{ col_letter }}"
                                 data-addr="{{ cell.addr }}" data-sid="{{ sec.id }}"
-                                title="{{ cell.addr }} (отработано)">
+                                onclick="toggleCellSelect(this, event)"
+                                title="{{ cell.addr }} (актуализировано, кликните для смены статуса)">
+                            {% elif cell.addr in data.changed and cell.addr in proc %}
+                            <td class="cell-processed{{ ' col-narrow' if is_narrow else '' }}{{ ' has-link' if cell.link else '' }}{{ ' col-hidden' if is_col_hidden else '' }}"
+                                data-col="{{ col_letter }}"
+                                data-addr="{{ cell.addr }}" data-sid="{{ sec.id }}"
+                                onclick="toggleCellSelect(this, event)"
+                                title="{{ cell.addr }} (отработано, кликните для актуализации)">
                             {% elif cell.addr in data.changed %}
-                            <td class="cell-changed{{ ' has-link' if cell.link else '' }}{{ ' col-hidden' if is_col_hidden else '' }}"
+                            <td class="cell-changed{{ ' col-narrow' if is_narrow else '' }}{{ ' has-link' if cell.link else '' }}{{ ' col-hidden' if is_col_hidden else '' }}"
                                 data-col="{{ col_letter }}"
                                 data-addr="{{ cell.addr }}" data-sid="{{ sec.id }}"
-                                onclick="toggleCellSelect(this)"
+                                onclick="toggleCellSelect(this, event)"
                                 title="{{ cell.addr }} (кликните для выделения)">
                             {% else %}
-                            <td class="{{ 'has-link ' if cell.link else '' }}{{ 'col-hidden' if is_col_hidden else '' }}"
+                            <td class="{{ 'col-narrow ' if is_narrow else '' }}{{ 'has-link ' if cell.link else '' }}{{ 'cell-linkable ' if cell.link else '' }}{{ 'col-hidden' if is_col_hidden else '' }}"
                                 data-col="{{ col_letter }}"
+                                {% if cell.link %}data-addr="{{ cell.addr }}" data-sid="{{ sec.id }}"
+                                onclick="toggleCellSelect(this, event)"{% endif %}
                                 title="{{ cell.addr }}">
                             {% endif %}
                                 {% if cell.link %}
                                     <a href="{{ cell.link }}" target="_blank"
-                                       style="color:#7b9bff;"
+                                       onclick="event.stopPropagation()"
+                                       class="cell-link-icon"
                                        title="{{ cell.link }}">&#8599;</a>
                                 {% else %}
                                     {{ cell.value }}
@@ -1161,14 +1444,37 @@ body {
 {% endif %}
 </main>
 
-<!-- Плавающая кнопка Отработано -->
-<button class="floating-processed" id="floatingProcessed" onclick="markSelectedProcessed()">
-    &#10003; Отработано (<span id="floatingCount">0</span>)
-</button>
-
 <script>
 var selectedCells = [];
 var projectId = '{{ current.id if current else "" }}';
+
+function showRenameForm() {
+    document.getElementById('projectTitle').style.display = 'none';
+    var form = document.getElementById('renameForm');
+    form.style.display = 'flex';
+    form.querySelector('input').focus();
+    form.querySelector('input').select();
+}
+function hideRenameForm() {
+    document.getElementById('projectTitle').style.display = 'flex';
+    document.getElementById('renameForm').style.display = 'none';
+}
+
+function confirmCheck(btn) {
+    var lastCheck = '{{ last_check_date }}';
+    if (lastCheck) {
+        var today = new Date().toLocaleDateString('ru-RU', {day:'2-digit', month:'2-digit', year:'numeric'});
+        var checkDate = lastCheck.split(' ')[0];
+        if (checkDate === today) {
+            if (!confirm('Таблица уже была обновлена сегодня (' + lastCheck + '). Обновить повторно?')) {
+                return;
+            }
+        }
+    }
+    btn.disabled = true;
+    btn.innerText = 'Загрузка...';
+    document.getElementById('checkForm').submit();
+}
 
 function toggleSection(btn) {
     var body = btn.closest('.section-card').querySelector('.section-body');
@@ -1180,6 +1486,32 @@ function toggleEditForm(btn) {
     var card = btn.closest('.section-card');
     var form = card.querySelector('.sec-edit-form');
     form.classList.toggle('open');
+}
+
+// ---- Column resize ----
+var resizeState = null;
+function startResize(e, handle) {
+    e.stopPropagation();
+    e.preventDefault();
+    var th = handle.parentElement;
+    resizeState = { th: th, startX: e.pageX, startW: th.offsetWidth };
+    handle.classList.add('resizing');
+    document.addEventListener('mousemove', doResize);
+    document.addEventListener('mouseup', stopResize);
+}
+function doResize(e) {
+    if (!resizeState) return;
+    var newW = Math.max(30, resizeState.startW + (e.pageX - resizeState.startX));
+    resizeState.th.style.width = newW + 'px';
+}
+function stopResize() {
+    if (resizeState) {
+        var handle = resizeState.th.querySelector('.resize-handle');
+        if (handle) handle.classList.remove('resizing');
+        resizeState = null;
+    }
+    document.removeEventListener('mousemove', doResize);
+    document.removeEventListener('mouseup', stopResize);
 }
 
 // ---- Column selection & hiding ----
@@ -1307,43 +1639,203 @@ function updateColHideBar(card, sid, pid) {
     }
 }
 
-function toggleCellSelect(td) {
+function toggleCellSelect(td, ev) {
+    if (ev) ev.preventDefault();
     var addr = td.getAttribute('data-addr');
     var sid = td.getAttribute('data-sid');
+    var wasProcessed = td.classList.contains('cell-processed');
+    var wasActualized = td.classList.contains('cell-actualized');
+    var wasChanged = td.classList.contains('cell-changed');
+    var wasNormal = !wasProcessed && !wasChanged && !wasActualized;
     var idx = selectedCells.findIndex(function(c) { return c.addr === addr && c.sid === sid; });
     if (idx >= 0) {
         selectedCells.splice(idx, 1);
         td.classList.remove('cell-selected');
-        td.classList.add('cell-changed');
+        if (td._wasProcessed) {
+            td.classList.add('cell-processed');
+        } else if (td._wasActualized) {
+            td.classList.add('cell-actualized');
+        } else if (td._wasNormal) {
+            // Обычная ячейка — не добавляем ничего
+        } else {
+            td.classList.add('cell-changed');
+        }
+        td._wasProcessed = false;
+        td._wasActualized = false;
+        td._wasNormal = false;
     } else {
+        td._wasProcessed = wasProcessed;
+        td._wasActualized = wasActualized;
+        td._wasNormal = wasNormal;
         selectedCells.push({addr: addr, sid: sid, el: td});
-        td.classList.remove('cell-changed');
+        td.classList.remove('cell-changed', 'cell-processed', 'cell-actualized', 'cell-linkable');
         td.classList.add('cell-selected');
     }
     updateSelectedUI();
 }
 
 function updateSelectedUI() {
-    var btn = document.getElementById('btnProcessed');
-    var cnt = document.getElementById('selectedCount');
-    if (btn && cnt) {
-        cnt.textContent = selectedCells.length;
-        if (selectedCells.length > 0) {
-            btn.classList.add('visible');
+    // Кнопки "Отработано" в заголовках разделов
+    var countBySid = {};
+    selectedCells.forEach(function(c) {
+        countBySid[c.sid] = (countBySid[c.sid] || 0) + 1;
+    });
+    document.querySelectorAll('.badge-processed-btn').forEach(function(b) {
+        var sid = b.getAttribute('data-sid');
+        var n = countBySid[sid] || 0;
+        var span = b.querySelector('.sec-sel-cnt');
+        if (span) span.textContent = n;
+        if (n > 0) {
+            b.classList.add('visible');
         } else {
-            btn.classList.remove('visible');
+            b.classList.remove('visible');
         }
+    });
+    // Кнопки "Актуально" в заголовках разделов
+    document.querySelectorAll('.badge-actualized-btn').forEach(function(b) {
+        var sid = b.getAttribute('data-sid');
+        var n = countBySid[sid] || 0;
+        var span = b.querySelector('.sec-act-cnt');
+        if (span) span.textContent = n;
+        if (n > 0) {
+            b.classList.add('visible');
+        } else {
+            b.classList.remove('visible');
+        }
+    });
+    // Кнопки "Отмена" в заголовках разделов
+    document.querySelectorAll('.badge-cancel-btn').forEach(function(b) {
+        var sid = b.getAttribute('data-sid');
+        var n = countBySid[sid] || 0;
+        var span = b.querySelector('.sec-cancel-cnt');
+        if (span) span.textContent = n;
+        if (n > 0) {
+            b.classList.add('visible');
+        } else {
+            b.classList.remove('visible');
+        }
+    });
+}
+
+function cancelSelection(btn) {
+    var sid = btn.getAttribute('data-sid');
+    var sectionCells = selectedCells.filter(function(c) { return c.sid === sid; });
+    if (sectionCells.length === 0) return;
+    sectionCells.forEach(function(c) {
+        c.el.classList.remove('cell-selected', 'cell-changed', 'cell-processed', 'cell-actualized', 'cell-linkable');
+        c.el._wasProcessed = false;
+        c.el._wasActualized = false;
+        c.el._wasNormal = false;
+    });
+    selectedCells = selectedCells.filter(function(c) { return c.sid !== sid; });
+    updateSelectedUI();
+}
+
+function markSectionProcessed(btn) {
+    var sid = btn.getAttribute('data-sid');
+    var sectionCells = selectedCells.filter(function(c) { return c.sid === sid; });
+    if (sectionCells.length === 0) return;
+
+    var addrs = sectionCells.map(function(c) { return c.addr; });
+    fetch('/project/' + projectId + '/section/' + sid + '/mark-processed', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({cells: addrs})
+    }).then(function() {
+        sectionCells.forEach(function(c) {
+            c.el.classList.remove('cell-selected', 'cell-changed', 'cell-actualized');
+            c.el.classList.add('cell-processed');
+            c.el.setAttribute('onclick', 'toggleCellSelect(this, event)');
+            c.el.title = c.addr + ' (отработано, кликните для смены статуса)';
+        });
+
+        // Убираем из selectedCells
+        selectedCells = selectedCells.filter(function(c) { return c.sid !== sid; });
+
+        // Обновляем общие счётчики
+        var processedEl = document.getElementById('processedCount');
+        var unprocessedEl = document.getElementById('unprocessedCount');
+        if (processedEl && unprocessedEl) {
+            processedEl.textContent = parseInt(processedEl.textContent) + sectionCells.length;
+            unprocessedEl.textContent = Math.max(0, parseInt(unprocessedEl.textContent) - sectionCells.length);
+        }
+
+        _updateSectionBadges(sid);
+        updateSelectedUI();
+    });
+}
+
+function markSectionActualized(btn) {
+    var sid = btn.getAttribute('data-sid');
+    var sectionCells = selectedCells.filter(function(c) { return c.sid === sid; });
+    if (sectionCells.length === 0) return;
+
+    var addrs = sectionCells.map(function(c) { return c.addr; });
+    fetch('/project/' + projectId + '/section/' + sid + '/mark-actualized', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({cells: addrs})
+    }).then(function() {
+        sectionCells.forEach(function(c) {
+            c.el.classList.remove('cell-selected', 'cell-changed', 'cell-processed', 'cell-linkable');
+            c.el.classList.add('cell-actualized');
+            c.el.setAttribute('onclick', 'toggleCellSelect(this, event)');
+            c.el.title = c.addr + ' (актуализировано, кликните для смены статуса)';
+        });
+
+        selectedCells = selectedCells.filter(function(c) { return c.sid !== sid; });
+
+        // Обновляем общий счётчик актуализированных
+        var actualizedEl = document.getElementById('actualizedCount');
+        if (actualizedEl) {
+            actualizedEl.textContent = parseInt(actualizedEl.textContent) + sectionCells.length;
+        }
+
+        _updateSectionBadges(sid);
+        updateSelectedUI();
+    });
+}
+
+function _updateSectionBadges(sid) {
+    var card = document.querySelector('.section-card[data-sid="' + sid + '"]');
+    if (!card) return;
+    var badges = card.querySelector('.badges');
+    var grid = card.querySelector('.grid');
+    if (!badges || !grid) return;
+
+    var changedCount = grid.querySelectorAll('.cell-changed').length;
+    var processedCount = grid.querySelectorAll('.cell-processed').length;
+    var actualizedCount = grid.querySelectorAll('.cell-actualized').length;
+
+    var oldBadges = badges.querySelectorAll('.badge-changes, .badge-ok, .badge-actual');
+    oldBadges.forEach(function(b) { b.remove(); });
+
+    var timeBadge = badges.querySelector('.badge-time');
+    var insertBefore = timeBadge || badges.querySelector('form');
+
+    if (changedCount > 0) {
+        var b = document.createElement('span');
+        b.className = 'badge badge-changes';
+        b.textContent = changedCount + ' изм.';
+        badges.insertBefore(b, insertBefore);
     }
-    // Плавающая кнопка
-    var floatBtn = document.getElementById('floatingProcessed');
-    var floatCnt = document.getElementById('floatingCount');
-    if (floatBtn && floatCnt) {
-        floatCnt.textContent = selectedCells.length;
-        if (selectedCells.length > 0) {
-            floatBtn.classList.add('visible');
-        } else {
-            floatBtn.classList.remove('visible');
-        }
+    if (processedCount > 0) {
+        var b2 = document.createElement('span');
+        b2.className = 'badge badge-ok';
+        b2.textContent = processedCount + ' отр.';
+        badges.insertBefore(b2, insertBefore);
+    }
+    if (actualizedCount > 0) {
+        var b3 = document.createElement('span');
+        b3.className = 'badge badge-actual';
+        b3.textContent = actualizedCount + ' акт.';
+        badges.insertBefore(b3, insertBefore);
+    }
+    if (changedCount === 0) {
+        var b4 = document.createElement('span');
+        b4.className = 'badge badge-ok';
+        b4.textContent = 'OK';
+        badges.insertBefore(b4, insertBefore);
     }
 }
 
@@ -1366,13 +1858,17 @@ function markSelectedProcessed() {
     });
 
     Promise.all(promises).then(function() {
+        // Собираем sid → количество отмеченных
+        var countBySid = {};
         selectedCells.forEach(function(c) {
             c.el.classList.remove('cell-selected', 'cell-changed');
             c.el.classList.add('cell-processed');
             c.el.removeAttribute('onclick');
             c.el.title = c.addr + ' (отработано)';
+            countBySid[c.sid] = (countBySid[c.sid] || 0) + 1;
         });
 
+        // Обновляем общие счётчики
         var processedEl = document.getElementById('processedCount');
         var unprocessedEl = document.getElementById('unprocessedCount');
         if (processedEl && unprocessedEl) {
@@ -1381,6 +1877,11 @@ function markSelectedProcessed() {
             processedEl.textContent = newProcessed;
             unprocessedEl.textContent = Math.max(0, newUnprocessed);
         }
+
+        // Обновляем бейджи на каждом разделе
+        Object.keys(countBySid).forEach(function(sid) {
+            _updateSectionBadges(sid);
+        });
 
         selectedCells = [];
         updateSelectedUI();
@@ -1405,5 +1906,109 @@ document.addEventListener('DOMContentLoaded', function() {
 </html>
 """
 
+# --------------- scheduled auto-check at 06:00 daily ---------------
+
+def _do_auto_check():
+    """Проверяет все проекты (аналог project_check) в фоне."""
+    try:
+        cfg = load_config()
+        for proj in cfg.get("projects", []):
+            pid = proj["id"]
+            old_snapshot = load_snapshot()
+            first_run = not old_snapshot
+            new_snapshot = dict(old_snapshot)
+            sc = load_section_cache()
+
+            try:
+                client = get_client()
+            except Exception:
+                continue
+
+            all_changes = load_changes()
+
+            for idx, sec in enumerate(proj["sections"]):
+                if idx > 0:
+                    time.sleep(3)
+                try:
+                    sp_id, gid = parse_url(sec["url"])
+                    if not sp_id:
+                        continue
+
+                    sheet_title, col_headers, rows, flat = read_grid(
+                        client, sp_id, gid, sec["range"]
+                    )
+
+                    changes_key = f"{pid}:{sec['id']}"
+                    saved_changes = set(all_changes.get(changes_key, []))
+
+                    if not first_run:
+                        for key, new_val in flat.items():
+                            old_val = old_snapshot.get(key)
+                            if old_val is not None and old_val != new_val:
+                                addr = key.split("!", 1)[1]
+                                saved_changes.add(addr)
+
+                    all_changes[changes_key] = list(saved_changes)
+                    changed = list(saved_changes)
+                    new_snapshot.update(flat)
+
+                    processed = load_processed()
+                    proc_list = processed.get(f"{pid}:{sec['id']}", [])
+                    hidden = load_hidden_cols()
+                    hidden_list = hidden.get(f"{pid}:{sec['id']}", [])
+                    act = load_actualized()
+                    act_list = act.get(f"{pid}:{sec['id']}", [])
+
+                    sc[sec["id"]] = {
+                        "sheet_title": sheet_title,
+                        "col_headers": col_headers,
+                        "rows": rows,
+                        "changed": changed,
+                        "processed": proc_list,
+                        "actualized": act_list,
+                        "hidden_cols": hidden_list,
+                        "total": len(changed),
+                        "checked_at": datetime.now().strftime("%H:%M:%S"),
+                        "first_run": first_run,
+                        "error": None,
+                    }
+                except Exception:
+                    pass
+
+            save_changes(all_changes)
+            save_snapshot(new_snapshot)
+            save_section_cache(sc)
+
+            lc = load_last_check()
+            lc[pid] = datetime.now().strftime("%d.%m.%Y %H:%M")
+            save_last_check(lc)
+
+            # Пауза между проектами
+            time.sleep(5)
+    except Exception:
+        pass
+
+
+def _schedule_loop():
+    """Фоновый цикл: запускает проверку ежедневно в 06:00."""
+    while True:
+        now = datetime.now()
+        target = now.replace(hour=6, minute=0, second=0, microsecond=0)
+        if now >= target:
+            # Сегодня 06:00 уже прошло — следующий запуск завтра
+            from datetime import timedelta
+            target += timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        time.sleep(wait_seconds)
+        _do_auto_check()
+
+
+# Запускаем планировщик при импорте (для gunicorn) и при прямом запуске
+_scheduler_thread = threading.Thread(target=_schedule_loop, daemon=True)
+_scheduler_thread.start()
+
+
 if __name__ == "__main__":
+    # Открываем браузер через 1.5 сек после старта сервера
+    threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:5000")).start()
     app.run(host="127.0.0.1", port=5000)
