@@ -14,7 +14,7 @@ from flask import Flask, render_template_string, redirect, url_for, request, jso
 
 from gspread.utils import rowcol_to_a1
 
-from watcher import get_client, load_snapshot, save_snapshot
+from watcher import get_client
 
 app = Flask(__name__)
 
@@ -25,101 +25,115 @@ if getattr(sys, 'frozen', False):
 else:
     PROJECT_DIR = Path(__file__).parent
 
-CONFIG_PATH = PROJECT_DIR / "config.json"
-PROCESSED_PATH = PROJECT_DIR / "processed.json"
-HIDDEN_COLS_PATH = PROJECT_DIR / "hidden_cols.json"
-CHANGES_PATH = PROJECT_DIR / "changes.json"
-CACHE_PATH = PROJECT_DIR / "cache.json"
-LAST_CHECK_PATH = PROJECT_DIR / "last_check.json"
-ACTUALIZED_PATH = PROJECT_DIR / "actualized.json"
+DATA_PATH = PROJECT_DIR / "data.json"
+
+# Пути старых файлов — для автомиграции
+_OLD_FILES = {
+    "config": PROJECT_DIR / "config.json",
+    "snapshot": PROJECT_DIR / "snapshot.json",
+    "processed": PROJECT_DIR / "processed.json",
+    "actualized": PROJECT_DIR / "actualized.json",
+    "changes": PROJECT_DIR / "changes.json",
+    "hidden_cols": PROJECT_DIR / "hidden_cols.json",
+    "last_check": PROJECT_DIR / "last_check.json",
+    "cache": PROJECT_DIR / "cache.json",
+}
+
+_DATA_DEFAULTS = {
+    "config": {"projects": []},
+    "snapshot": {},
+    "processed": {},
+    "actualized": {},
+    "changes": {},
+    "hidden_cols": {},
+    "last_check": {},
+    "cache": {},
+}
+
+
+def _migrate_to_single_file() -> None:
+    """При первом запуске: собирает старые JSON-файлы в единый data.json."""
+    if DATA_PATH.exists():
+        return
+    data = {}
+    for key, path in _OLD_FILES.items():
+        if path.exists():
+            try:
+                data[key] = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                data[key] = _DATA_DEFAULTS[key]
+        else:
+            data[key] = _DATA_DEFAULTS[key]
+    save_data(data)
+    # Удаляем старые файлы после успешной миграции
+    for key, path in _OLD_FILES.items():
+        if path.exists():
+            path.unlink()
+
+
+def load_data() -> dict:
+    if not DATA_PATH.exists():
+        return {k: dict(v) if isinstance(v, dict) else v for k, v in _DATA_DEFAULTS.items()}
+    try:
+        data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {k: dict(v) if isinstance(v, dict) else v for k, v in _DATA_DEFAULTS.items()}
+    for key, default in _DATA_DEFAULTS.items():
+        if key not in data:
+            data[key] = default
+    return data
+
+
+def save_data(data: dict) -> None:
+    DATA_PATH.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 # --------------- helpers ---------------
 
 def load_hidden_cols() -> dict:
-    if HIDDEN_COLS_PATH.exists():
-        return json.loads(HIDDEN_COLS_PATH.read_text(encoding="utf-8"))
-    return {}
-
+    return load_data()["hidden_cols"]
 
 def save_hidden_cols(data: dict) -> None:
-    HIDDEN_COLS_PATH.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
+    d = load_data(); d["hidden_cols"] = data; save_data(d)
 
 def load_processed() -> dict:
-    if PROCESSED_PATH.exists():
-        return json.loads(PROCESSED_PATH.read_text(encoding="utf-8"))
-    return {}
-
+    return load_data()["processed"]
 
 def save_processed(data: dict) -> None:
-    PROCESSED_PATH.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
+    d = load_data(); d["processed"] = data; save_data(d)
 
 def load_changes() -> dict:
-    """Загружает накопленные изменения {pid:sid: [addr1, addr2, ...]}."""
-    if CHANGES_PATH.exists():
-        return json.loads(CHANGES_PATH.read_text(encoding="utf-8"))
-    return {}
-
+    return load_data()["changes"]
 
 def save_changes(data: dict) -> None:
-    CHANGES_PATH.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
+    d = load_data(); d["changes"] = data; save_data(d)
 
 def load_config() -> dict:
-    text = CONFIG_PATH.read_text(encoding="utf-8")
-    return json.loads(text)
-
+    return load_data()["config"]
 
 def save_config(cfg: dict) -> None:
-    CONFIG_PATH.write_text(
-        json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
+    d = load_data(); d["config"] = cfg; save_data(d)
 
 def load_actualized() -> dict:
-    """Загружает актуализированные ячейки {pid:sid: [addr1, addr2, ...]}."""
-    if ACTUALIZED_PATH.exists():
-        try:
-            return json.loads(ACTUALIZED_PATH.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
-
+    return load_data()["actualized"]
 
 def save_actualized(data: dict) -> None:
-    ACTUALIZED_PATH.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
+    d = load_data(); d["actualized"] = data; save_data(d)
 
 def load_last_check() -> dict:
-    """Загружает даты последней проверки {pid: "2026-02-24 06:00"}."""
-    if LAST_CHECK_PATH.exists():
-        try:
-            return json.loads(LAST_CHECK_PATH.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
-
+    return load_data()["last_check"]
 
 def save_last_check(data: dict) -> None:
-    LAST_CHECK_PATH.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    d = load_data(); d["last_check"] = data; save_data(d)
+
+def load_snapshot() -> dict:
+    return load_data()["snapshot"]
+
+def save_snapshot(data: dict) -> None:
+    d = load_data(); d["snapshot"] = data; save_data(d)
 
 
 def find_project(cfg, pid):
@@ -251,21 +265,12 @@ def read_grid(client, spreadsheet_id, gid, range_str):
     return sheet_title, col_headers, rows, flat
 
 
-# Кеш результатов по секциям — хранится в файле, доступен всем воркерам
+# Кеш результатов по секциям
 def load_section_cache() -> dict:
-    if CACHE_PATH.exists():
-        try:
-            return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
-
+    return load_data()["cache"]
 
 def save_section_cache(data: dict) -> None:
-    CACHE_PATH.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    d = load_data(); d["cache"] = data; save_data(d)
 
 
 # --------------- routes ---------------
@@ -621,6 +626,7 @@ HTML = """
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sheets Watcher</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='2' y='2' width='20' height='24' rx='2' fill='%23185a30' stroke='%234caf50' stroke-width='1.5'/><line x1='8' y1='8' x2='18' y2='8' stroke='%234caf50' stroke-width='1.5'/><line x1='8' y1='13' x2='18' y2='13' stroke='%234caf50' stroke-width='1.5'/><line x1='8' y1='18' x2='14' y2='18' stroke='%234caf50' stroke-width='1.5'/><line x1='5' y1='8' x2='6' y2='8' stroke='%2381c784' stroke-width='1.5'/><line x1='5' y1='13' x2='6' y2='13' stroke='%2381c784' stroke-width='1.5'/><line x1='5' y1='18' x2='6' y2='18' stroke='%2381c784' stroke-width='1.5'/><circle cx='22' cy='22' r='6' fill='%230d1b2a' stroke='%237b68ee' stroke-width='1.5'/><line x1='26.5' y1='26.5' x2='30' y2='30' stroke='%237b68ee' stroke-width='2' stroke-linecap='round'/><circle cx='22' cy='22' r='2' fill='none' stroke='%237b68ee' stroke-width='1'/></svg>">
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; }
@@ -2009,6 +2015,7 @@ _scheduler_thread.start()
 
 
 if __name__ == "__main__":
+    _migrate_to_single_file()
     # Открываем браузер через 1.5 сек после старта сервера
     threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:5000")).start()
     app.run(host="127.0.0.1", port=5000)

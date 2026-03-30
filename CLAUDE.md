@@ -21,11 +21,30 @@ python sheets-watcher/watcher.py
 
 ## Архитектура
 
-Два режима работы: веб-интерфейс и CLI. `app.py` импортирует `get_client`, `load_snapshot`, `save_snapshot` из `watcher.py`.
+Два режима работы: веб-интерфейс и CLI. `app.py` импортирует `get_client` из `watcher.py` для авторизации Google API.
 
-- **`app.py`** (~1400 строк) — Flask single-page приложение с inline Jinja2-шаблоном (HTML/CSS/JS в одном файле). Управление проектами и разделами через UI. При "Проверить все" читает ячейки через Sheets API v4, сравнивает со снимком, подсвечивает изменённые ячейки красным. Поддерживает отметку обработанных ячеек (зелёный) и скрытие столбцов.
+- **`app.py`** — Flask single-page приложение с inline Jinja2-шаблоном (HTML/CSS/JS в одном файле). Управление проектами и разделами через UI. При "Проверить все" читает ячейки через Sheets API v4, сравнивает со снимком, подсвечивает изменённые ячейки красным. Поддерживает отметку обработанных ячеек (зелёный) и скрытие столбцов.
 
-- **`watcher.py`** (~215 строк) — CLI-режим и библиотека. Авторизация через сервисный аккаунт (`get_client`), чтение диапазонов (`read_ranges`), снимки (`load_snapshot`/`save_snapshot`), сравнение (`compare`), отчёт (`print_report`).
+- **`watcher.py`** — CLI-режим и библиотека. Авторизация через сервисный аккаунт (`get_client`), чтение диапазонов (`read_ranges`), снимки (`load_snapshot`/`save_snapshot`), сравнение (`compare`), отчёт (`print_report`).
+
+### Хранение данных: единый `data.json`
+
+Всё состояние хранится в `sheets-watcher/data.json` — один JSON-файл со следующими ключами:
+
+| Ключ | Назначение |
+|---|---|
+| `config` | Конфигурация проектов/разделов (`{projects: [...]}`) |
+| `snapshot` | Последний снимок ячеек, ключи: `spreadsheet_id!A1-адрес` |
+| `processed` | Отработанные ячейки, ключи: `project_id:section_id` → `[адреса]` |
+| `actualized` | Актуализированные ячейки |
+| `changes` | Сохранённые изменения между проверками |
+| `hidden_cols` | Скрытые столбцы, ключи: `project_id:section_id` → `[буквы]` |
+| `last_check` | Время последней проверки по разделам |
+| `cache` | Кеш результатов проверки |
+
+При первом запуске `app.py` автоматически мигрирует старые отдельные JSON-файлы (`config.json`, `snapshot.json` и т.д.) в единый `data.json` через `_migrate_to_single_file()`.
+
+Оба модуля используют `PROJECT_DIR` с поддержкой PyInstaller (`sys.frozen`): при сборке в .exe данные лежат рядом с исполняемым файлом.
 
 ### REST API маршруты (app.py)
 
@@ -42,21 +61,11 @@ python sheets-watcher/watcher.py
 | `/project/<pid>/section/<sid>/hide-cols` | POST | Скрыть столбцы (JSON) |
 | `/project/<pid>/section/<sid>/unhide-cols` | POST | Показать скрытые столбцы (JSON) |
 
-### Ключевые файлы данных (в `sheets-watcher/`)
-
-| Файл | Назначение |
-|---|---|
-| `config.json` | Конфигурация проектов/разделов (читается/пишется app.py) |
-| `snapshot.json` | Последний снимок ячеек, ключи: `spreadsheet_id!A1-адрес` |
-| `processed.json` | Отработанные ячейки, ключи: `project_id:section_id` → `[адреса]` |
-| `hidden_cols.json` | Скрытые столбцы, ключи: `project_id:section_id` → `[буквы]` |
-| `credentials.json` | JSON-ключ сервисного аккаунта Google (НЕ коммитить) |
-
 ### Особенности
 
 - **Два формата конфига**: `app.py` использует `projects[].sections[].{url, range}` с парсингом URL, а `watcher.py` CLI — `spreadsheets[].{id, ranges, sheet}`. Они не взаимозаменяемы.
-- Веб-интерфейс хранит результаты проверки в in-memory кеше `section_cache` (сбрасывается при перезапуске).
 - `app.py` извлекает `HYPERLINK` формулы из ячеек и рендерит их как кликабельные ссылки.
 - Поддержка нескольких диапазонов через запятую в поле `range`: `"A4:C24, G4:Y24"`.
 - ID проектов/разделов генерируются как `uuid.uuid4().hex[:8]`.
 - Python 3.12+ (используется синтаксис `type | None`).
+- `credentials.json` — ключ сервисного аккаунта Google, НЕ коммитить.

@@ -19,8 +19,8 @@ else:
     PROJECT_DIR = Path(__file__).parent
 
 CREDENTIALS_PATH = PROJECT_DIR / "credentials.json"
-SNAPSHOT_PATH = PROJECT_DIR / "snapshot.json"
-CONFIG_PATH = PROJECT_DIR / "config.json"
+DATA_PATH = PROJECT_DIR / "data.json"
+CONFIG_PATH = PROJECT_DIR / "config.json"  # fallback для CLI
 
 
 def get_client() -> gspread.Client:
@@ -75,28 +75,34 @@ def read_ranges(
 
 # --------------- snapshot ---------------
 
-def load_snapshot() -> dict[str, str]:
-    """Читает snapshot.json. Если файла нет или он пуст/повреждён — возвращает {}."""
-    if not SNAPSHOT_PATH.exists():
+def _load_data() -> dict:
+    """Читает единый data.json."""
+    if not DATA_PATH.exists():
         return {}
-
-    text = SNAPSHOT_PATH.read_text(encoding="utf-8").strip()
-    if not text:
-        return {}
-
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        print("[ПРЕДУПРЕЖДЕНИЕ] snapshot.json повреждён, начинаем с чистого снимка.")
+        return json.loads(DATA_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
         return {}
 
 
-def save_snapshot(data: dict[str, str]) -> None:
-    """Сохраняет данные в snapshot.json с отступами для читаемости."""
-    SNAPSHOT_PATH.write_text(
+def _save_data(data: dict) -> None:
+    DATA_PATH.write_text(
         json.dumps(data, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def load_snapshot() -> dict[str, str]:
+    """Читает snapshot из data.json."""
+    data = _load_data()
+    return data.get("snapshot", {})
+
+
+def save_snapshot(data: dict[str, str]) -> None:
+    """Сохраняет snapshot в data.json."""
+    d = _load_data()
+    d["snapshot"] = data
+    _save_data(d)
 
 
 def compare(
@@ -155,13 +161,16 @@ def main() -> None:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n[{now}] Запуск проверки таблиц...")
 
-    if not CONFIG_PATH.exists():
-        sys.exit(f"[ОШИБКА] Файл {CONFIG_PATH} не найден.")
+    if not DATA_PATH.exists() and not CONFIG_PATH.exists():
+        sys.exit(f"[ОШИБКА] Файл {DATA_PATH} не найден.")
 
-    try:
-        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        sys.exit(f"[ОШИБКА] config.json повреждён: {e}")
+    data = _load_data()
+    config = data.get("config", {})
+    if not config and CONFIG_PATH.exists():
+        try:
+            config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            sys.exit(f"[ОШИБКА] config.json повреждён: {e}")
 
     old_snapshot = load_snapshot()
     first_run = not old_snapshot
