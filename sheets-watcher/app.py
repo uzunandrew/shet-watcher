@@ -120,15 +120,13 @@ def read_grid(client, spreadsheet_id, gid, range_str):
                         if hyperlink:
                             link_map[(sub_min_row + r_idx, sub_min_col + c_idx)] = hyperlink
     except Exception as exc:
-        print(f"[DEBUG hyperlinks] API ошибка: {type(exc).__name__}: {exc}")
+        logger.warning("Hyperlinks API ошибка: %s: %s", type(exc).__name__, exc)
 
     # Fallback: если ячейка содержит URL как текст — считаем его ссылкой
     url_re = re.compile(r'^https?://\S+$')
     for (row, col), val in cell_map.items():
         if (row, col) not in link_map and val and url_re.match(val.strip()):
             link_map[(row, col)] = val.strip()
-
-    print(f"[DEBUG hyperlinks] Найдено ссылок: {len(link_map)}")
 
     # Заголовки столбцов — только фактические (без пропусков)
     col_headers = []

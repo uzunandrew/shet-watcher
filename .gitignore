@@ -1,7 +1,13 @@
 # Credentials
 credentials.json
-voiceasstaibot-9c7dbe6d59a8.json
+credentials.json.*
+voiceasstaibot-*.json
 sheets-watcher/credentials.json
+sheets-watcher/credentials.json.*
+sheets-watcher/voiceasstaibot-*.json
+*.service-account.json
+.env
+.env.*
 
 # Python
 __pycache__/
