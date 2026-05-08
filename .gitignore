@@ -6,6 +6,8 @@ sheets-watcher/credentials.json
 # Python
 __pycache__/
 *.pyc
+.venv/
+venv/
 
 # Data (local state)
 sheets-watcher/snapshot.json
