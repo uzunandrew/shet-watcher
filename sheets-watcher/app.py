@@ -358,9 +358,15 @@ def _run_project_check(client, proj, capture_invalid_url_error: bool = True) -> 
 
             # Гигиена: reopened/proc/act, попавшие в "сироты" (нет в changed),
             # отфильтровываем — иначе портят счётчики на UI.
+            orig_proc_count = len(proc_set)
+            orig_act_count = len(act_set)
             reopened_set &= saved_changes
             proc_set &= saved_changes
             act_set &= saved_changes
+            if len(proc_set) != orig_proc_count:
+                processed_dirty = True
+            if len(act_set) != orig_act_count:
+                actualized_dirty = True
 
             all_changes[sec_key] = list(saved_changes)
             processed_all[sec_key] = list(proc_set)
@@ -2189,100 +2195,20 @@ document.addEventListener('DOMContentLoaded', function() {
 # --------------- scheduled auto-check at 06:00 daily ---------------
 
 def _do_auto_check():
-    """Проверяет все проекты (аналог project_check) в фоне."""
+    """Фоновая ежедневная проверка всех проектов. Использует ту же логику,
+    что и ручная (project_check), через общий helper _run_project_check."""
     try:
         cfg = load_config()
+        try:
+            client = get_client()
+        except Exception:
+            return
         for proj in cfg.get("projects", []):
-            pid = proj["id"]
-            old_snapshot = load_snapshot()
-            first_run = not old_snapshot
-            new_snapshot = dict(old_snapshot)
-            sc = load_section_cache()
-
             try:
-                client = get_client()
+                _run_project_check(client, proj)
             except Exception:
-                continue
-
-            all_changes = load_changes()
-            processed_all = load_processed()
-            actualized_all = load_actualized()
-            hidden_all = load_hidden_cols()
-            processed_dirty = False
-            actualized_dirty = False
-
-            for idx, sec in enumerate(proj["sections"]):
-                if idx > 0:
-                    time.sleep(3)
-                try:
-                    sp_id, gid = parse_url(sec["url"])
-                    if not sp_id:
-                        continue
-
-                    sheet_title, col_headers, rows, flat = read_grid(
-                        client, sp_id, gid, sec["range"]
-                    )
-
-                    sec_key = f"{pid}:{sec['id']}"
-                    saved_changes = set(all_changes.get(sec_key, []))
-                    proc_set = set(processed_all.get(sec_key, []))
-                    act_set = set(actualized_all.get(sec_key, []))
-                    reopened_set = set(sc.get(sec["id"], {}).get("reopened", []))
-
-                    if not first_run:
-                        for key, new_val in flat.items():
-                            old_val = old_snapshot.get(key)
-                            if old_val is not None and old_val != new_val:
-                                addr = key.split("!", 1)[1]
-                                saved_changes.add(addr)
-                                was_proc = addr in proc_set
-                                was_act = addr in act_set
-                                if was_proc:
-                                    proc_set.discard(addr)
-                                    processed_dirty = True
-                                if was_act:
-                                    act_set.discard(addr)
-                                    actualized_dirty = True
-                                if was_proc or was_act:
-                                    reopened_set.add(addr)
-
-                    all_changes[sec_key] = list(saved_changes)
-                    processed_all[sec_key] = list(proc_set)
-                    actualized_all[sec_key] = list(act_set)
-                    changed = list(saved_changes)
-                    new_snapshot.update(flat)
-
-                    sc[sec["id"]] = {
-                        "sheet_title": sheet_title,
-                        "col_headers": col_headers,
-                        "rows": rows,
-                        "changed": changed,
-                        "processed": list(proc_set),
-                        "actualized": list(act_set),
-                        "reopened": list(reopened_set),
-                        "hidden_cols": hidden_all.get(sec_key, []),
-                        "total": len(changed),
-                        "checked_at": datetime.now().strftime("%H:%M:%S"),
-                        "first_run": first_run,
-                        "error": None,
-                    }
-                except Exception:
-                    pass
-
-            save_changes(all_changes)
-            if processed_dirty:
-                save_processed(processed_all)
-            if actualized_dirty:
-                save_actualized(actualized_all)
-            save_snapshot(new_snapshot)
-            save_section_cache(sc)
-
-            lc = load_last_check()
-            lc[pid] = datetime.now().strftime("%d.%m.%Y %H:%M")
-            save_last_check(lc)
-
-            # Пауза между проектами
-            time.sleep(5)
+                pass
+            time.sleep(5)  # пауза между проектами
     except Exception:
         pass
 
