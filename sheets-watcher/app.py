@@ -194,6 +194,7 @@ def project_view(pid):
             sc[sec["id"]]["hidden_cols"] = hidden.get(key, [])
             sc[sec["id"]]["processed"] = processed.get(key, [])
             sc[sec["id"]]["actualized"] = actualized.get(key, [])
+            sc[sec["id"]].setdefault("reopened", [])
             # Восстанавливаем accumulated changes
             saved_ch = all_changes.get(key, [])
             if saved_ch and not sc[sec["id"]].get("changed"):
@@ -295,6 +296,108 @@ def section_edit(pid, sid):
     return redirect(url_for("project_view", pid=pid))
 
 
+def _run_project_check(client, proj, capture_invalid_url_error: bool = True) -> None:
+    """Общая бизнес-логика проверки одного проекта.
+
+    Используется и ручной (project_check), и фоновой (_do_auto_check) проверкой —
+    логика повторного изменения, обновления snapshot и кеша должна быть единой.
+    """
+    pid = proj["id"]
+    old_snapshot = load_snapshot()
+    first_run = not old_snapshot
+    new_snapshot = dict(old_snapshot)
+
+    sc = load_section_cache()
+    sc.pop(f"_error_{pid}", None)
+
+    all_changes = load_changes()
+    processed_all = load_processed()
+    actualized_all = load_actualized()
+    hidden_all = load_hidden_cols()
+    processed_dirty = False
+    actualized_dirty = False
+
+    for idx, sec in enumerate(proj["sections"]):
+        if idx > 0:
+            time.sleep(3)  # пауза между разделами для API лимита
+        try:
+            sp_id, gid = parse_url(sec["url"])
+            if not sp_id:
+                if capture_invalid_url_error:
+                    sc[sec["id"]] = {"error": "Невалидная ссылка"}
+                continue
+
+            sheet_title, col_headers, rows, flat = read_grid(
+                client, sp_id, gid, sec["range"]
+            )
+
+            sec_key = f"{pid}:{sec['id']}"
+            saved_changes = set(all_changes.get(sec_key, []))
+            proc_set = set(processed_all.get(sec_key, []))
+            act_set = set(actualized_all.get(sec_key, []))
+            reopened_set = set(sc.get(sec["id"], {}).get("reopened", []))
+
+            if not first_run:
+                for key, new_val in flat.items():
+                    old_val = old_snapshot.get(key)
+                    if old_val is not None and old_val != new_val:
+                        addr = key.split("!", 1)[1]
+                        saved_changes.add(addr)
+                        # Повторное изменение после отработки/актуализации:
+                        # снимаем старый статус и фиксируем как reopened.
+                        was_proc = addr in proc_set
+                        was_act = addr in act_set
+                        if was_proc:
+                            proc_set.discard(addr)
+                            processed_dirty = True
+                        if was_act:
+                            act_set.discard(addr)
+                            actualized_dirty = True
+                        if was_proc or was_act:
+                            reopened_set.add(addr)
+
+            # Гигиена: reopened/proc/act, попавшие в "сироты" (нет в changed),
+            # отфильтровываем — иначе портят счётчики на UI.
+            reopened_set &= saved_changes
+            proc_set &= saved_changes
+            act_set &= saved_changes
+
+            all_changes[sec_key] = list(saved_changes)
+            processed_all[sec_key] = list(proc_set)
+            actualized_all[sec_key] = list(act_set)
+            new_snapshot.update(flat)
+
+            sc[sec["id"]] = {
+                "sheet_title": sheet_title,
+                "col_headers": col_headers,
+                "rows": rows,
+                "changed": list(saved_changes),
+                "processed": list(proc_set),
+                "actualized": list(act_set),
+                "reopened": list(reopened_set),
+                "hidden_cols": hidden_all.get(sec_key, []),
+                "total": len(saved_changes),
+                "checked_at": datetime.now().strftime("%H:%M:%S"),
+                "first_run": first_run,
+                "error": None,
+            }
+        except Exception as e:
+            if capture_invalid_url_error:
+                sc[sec["id"]] = {"error": str(e)}
+
+    save_changes(all_changes)
+    if processed_dirty:
+        save_processed(processed_all)
+    if actualized_dirty:
+        save_actualized(actualized_all)
+    save_snapshot(new_snapshot)
+    save_section_cache(sc)
+
+    lc = load_last_check()
+    lc[pid] = datetime.now().strftime("%d.%m.%Y %H:%M")
+    save_last_check(lc)
+
+
 @app.route("/project/<pid>/check", methods=["POST"])
 def project_check(pid):
     cfg = load_config()
@@ -302,92 +405,15 @@ def project_check(pid):
     if not proj:
         return redirect(url_for("index"))
 
-    old_snapshot = load_snapshot()
-    first_run = not old_snapshot
-    new_snapshot = dict(old_snapshot)
-
-    sc = load_section_cache()
-
     try:
         client = get_client()
     except Exception as e:
+        sc = load_section_cache()
         sc[f"_error_{pid}"] = {"error": str(e)}
         save_section_cache(sc)
         return redirect(url_for("project_view", pid=pid))
 
-    sc.pop(f"_error_{pid}", None)
-
-    all_changes = load_changes()
-
-    for idx, sec in enumerate(proj["sections"]):
-        if idx > 0:
-            time.sleep(3)  # задержка между разделами для API лимита
-        try:
-            sp_id, gid = parse_url(sec["url"])
-            if not sp_id:
-                sc[sec["id"]] = {"error": "Невалидная ссылка"}
-                continue
-
-            sheet_title, col_headers, rows, flat = read_grid(
-                client, sp_id, gid, sec["range"]
-            )
-
-            # Ключ для хранения накопленных изменений
-            changes_key = f"{pid}:{sec['id']}"
-            saved_changes = set(all_changes.get(changes_key, []))
-
-            # Находим новые изменения (сравниваем со snapshot)
-            if not first_run:
-                for key, new_val in flat.items():
-                    old_val = old_snapshot.get(key)
-                    if old_val is not None and old_val != new_val:
-                        addr = key.split("!", 1)[1]
-                        saved_changes.add(addr)
-
-            # Сохраняем накопленные изменения
-            all_changes[changes_key] = list(saved_changes)
-
-            # Список changed = все накопленные изменения
-            changed = list(saved_changes)
-
-            new_snapshot.update(flat)
-
-            processed = load_processed()
-            proc_key = f"{pid}:{sec['id']}"
-            proc_list = processed.get(proc_key, [])
-
-            hidden = load_hidden_cols()
-            hidden_key = f"{pid}:{sec['id']}"
-            hidden_list = hidden.get(hidden_key, [])
-
-            act = load_actualized()
-            act_list = act.get(f"{pid}:{sec['id']}", [])
-
-            sc[sec["id"]] = {
-                "sheet_title": sheet_title,
-                "col_headers": col_headers,
-                "rows": rows,
-                "changed": changed,
-                "processed": proc_list,
-                "actualized": act_list,
-                "hidden_cols": hidden_list,
-                "total": len(changed),
-                "checked_at": datetime.now().strftime("%H:%M:%S"),
-                "first_run": first_run,
-                "error": None,
-            }
-        except Exception as e:
-            sc[sec["id"]] = {"error": str(e)}
-
-    save_changes(all_changes)
-    save_snapshot(new_snapshot)
-    save_section_cache(sc)
-
-    # Сохраняем дату последней проверки
-    lc = load_last_check()
-    lc[pid] = datetime.now().strftime("%d.%m.%Y %H:%M")
-    save_last_check(lc)
-
+    _run_project_check(client, proj)
     return redirect(url_for("project_view", pid=pid))
 
 
@@ -398,23 +424,28 @@ def mark_processed(pid, sid):
     if not cells:
         return jsonify(ok=False)
 
-    processed = load_processed()
+    cells_set = set(cells)
     key = f"{pid}:{sid}"
-    if key not in processed:
-        processed[key] = []
-    for addr in cells:
-        if addr not in processed[key]:
-            processed[key].append(addr)
-    save_processed(processed)
 
-    # Обновим кеш: перенести ячейки из changed в processed
+    processed = load_processed()
+    actualized = load_actualized()
+    proc_set = set(processed.get(key, []))
+    act_set = set(actualized.get(key, []))
+    proc_set |= cells_set
+    act_set -= cells_set  # отработано исключает актуализировано
+    processed[key] = list(proc_set)
+    actualized[key] = list(act_set)
+    save_processed(processed)
+    save_actualized(actualized)
+
     sc = load_section_cache()
     if sid in sc:
-        if "processed" not in sc[sid]:
-            sc[sid]["processed"] = []
-        for addr in cells:
-            if addr not in sc[sid]["processed"]:
-                sc[sid]["processed"].append(addr)
+        sc[sid]["processed"] = list(proc_set)
+        sc[sid]["actualized"] = list(act_set)
+        # Снимаем признак повторного изменения — теперь ячейка вновь отработана
+        reopened = set(sc[sid].get("reopened", []))
+        reopened -= cells_set
+        sc[sid]["reopened"] = list(reopened)
         save_section_cache(sc)
 
     return jsonify(ok=True)
@@ -427,23 +458,27 @@ def mark_actualized(pid, sid):
     if not cells:
         return jsonify(ok=False)
 
-    actualized = load_actualized()
+    cells_set = set(cells)
     key = f"{pid}:{sid}"
-    if key not in actualized:
-        actualized[key] = []
-    for addr in cells:
-        if addr not in actualized[key]:
-            actualized[key].append(addr)
+
+    processed = load_processed()
+    actualized = load_actualized()
+    proc_set = set(processed.get(key, []))
+    act_set = set(actualized.get(key, []))
+    act_set |= cells_set
+    proc_set -= cells_set  # актуализировано исключает отработано
+    processed[key] = list(proc_set)
+    actualized[key] = list(act_set)
+    save_processed(processed)
     save_actualized(actualized)
 
-    # Обновим кеш
     sc = load_section_cache()
     if sid in sc:
-        if "actualized" not in sc[sid]:
-            sc[sid]["actualized"] = []
-        for addr in cells:
-            if addr not in sc[sid]["actualized"]:
-                sc[sid]["actualized"].append(addr)
+        sc[sid]["processed"] = list(proc_set)
+        sc[sid]["actualized"] = list(act_set)
+        reopened = set(sc[sid].get("reopened", []))
+        reopened -= cells_set
+        sc[sid]["reopened"] = list(reopened)
         save_section_cache(sc)
 
     return jsonify(ok=True)
@@ -460,21 +495,73 @@ def dismiss_changes(pid, sid):
     key = f"{pid}:{sid}"
     cells_set = set(cells)
 
-    # Удаляем из changes
     all_changes = load_changes()
     if key in all_changes:
         all_changes[key] = [c for c in all_changes[key] if c not in cells_set]
         save_changes(all_changes)
 
-    # Обновляем snapshot: ставим текущее значение чтобы при следующей проверке не считалось изменением
-    # (ничего не делаем — snapshot уже актуален)
+    # Заодно убираем эти адреса из processed/actualized — иначе после удаления
+    # из changed они продолжат висеть в счётчиках без подложки
+    processed = load_processed()
+    actualized = load_actualized()
+    proc_dirty = key in processed and any(a in cells_set for a in processed[key])
+    act_dirty = key in actualized and any(a in cells_set for a in actualized[key])
+    if proc_dirty:
+        processed[key] = [c for c in processed[key] if c not in cells_set]
+        save_processed(processed)
+    if act_dirty:
+        actualized[key] = [c for c in actualized[key] if c not in cells_set]
+        save_actualized(actualized)
 
-    # Удаляем из кеша
     sc = load_section_cache()
     if sid in sc:
         if "changed" in sc[sid]:
             sc[sid]["changed"] = [c for c in sc[sid]["changed"] if c not in cells_set]
             sc[sid]["total"] = len(sc[sid]["changed"])
+        if "processed" in sc[sid]:
+            sc[sid]["processed"] = [c for c in sc[sid]["processed"] if c not in cells_set]
+        if "actualized" in sc[sid]:
+            sc[sid]["actualized"] = [c for c in sc[sid]["actualized"] if c not in cells_set]
+        if "reopened" in sc[sid]:
+            sc[sid]["reopened"] = [c for c in sc[sid]["reopened"] if c not in cells_set]
+        save_section_cache(sc)
+
+    return jsonify(ok=True)
+
+
+@app.route("/project/<pid>/section/<sid>/reopen", methods=["POST"])
+def reopen_cells(pid, sid):
+    """Снимает статус 'отработано'/'актуализировано', оставляя ячейку в changed.
+    Используется кнопкой '↺ В новые' для ручного отката накопленных ошибок.
+    """
+    data = request.get_json(force=True)
+    cells = data.get("cells", [])
+    if not cells:
+        return jsonify(ok=False)
+
+    cells_set = set(cells)
+    key = f"{pid}:{sid}"
+
+    processed = load_processed()
+    actualized = load_actualized()
+    proc_dirty = key in processed and any(a in cells_set for a in processed[key])
+    act_dirty = key in actualized and any(a in cells_set for a in actualized[key])
+    if proc_dirty:
+        processed[key] = [c for c in processed[key] if c not in cells_set]
+        save_processed(processed)
+    if act_dirty:
+        actualized[key] = [c for c in actualized[key] if c not in cells_set]
+        save_actualized(actualized)
+
+    sc = load_section_cache()
+    if sid in sc:
+        if "processed" in sc[sid]:
+            sc[sid]["processed"] = [c for c in sc[sid]["processed"] if c not in cells_set]
+        if "actualized" in sc[sid]:
+            sc[sid]["actualized"] = [c for c in sc[sid]["actualized"] if c not in cells_set]
+        # reopened сохраняется как есть: если ячейка реально была авто-помечена
+        # как повторно изменённая, признак не должен теряться от ручного "В новые".
+        # Если её в reopened не было, она просто станет обычной cell-changed.
         save_section_cache(sc)
 
     return jsonify(ok=True)
@@ -545,17 +632,22 @@ body {
     color: #d0d0d0;
     display: flex;
     overflow: hidden;
+    height: 100vh;
+    /* dvh учитывает мобильные адресные строки */
+    height: 100dvh;
 }
 
 /* ---- sidebar ---- */
 .sidebar {
     width: 260px;
     min-width: 260px;
+    flex-shrink: 0;
     background: #12122a;
     border-right: 1px solid #1e1e3a;
     display: flex;
     flex-direction: column;
     height: 100vh;
+    height: 100dvh;
 }
 .sidebar-head {
     padding: 20px;
@@ -629,8 +721,11 @@ body {
 /* ---- main ---- */
 .main {
     flex: 1;
+    min-width: 0;
     overflow-y: auto;
+    overflow-x: hidden;
     height: 100vh;
+    height: 100dvh;
     padding: 28px 32px;
 }
 .main-head {
@@ -720,7 +815,10 @@ body {
     border: 1px solid #1e1e3a;
     border-radius: 10px;
     margin-bottom: 6px;
-    overflow: hidden;
+    /* overflow: hidden убран — иначе ломает sticky-заголовки таблицы */
+}
+.section-card .section-header {
+    border-radius: 10px 10px 0 0;
 }
 .section-header {
     display: flex;
@@ -753,6 +851,10 @@ body {
 .badge-changes-click:hover { background: #5a1010; transform: scale(1.05); }
 .badge-first { background: #3d2e0a; color: #ff9800; }
 .badge-actual { background: #0a1a3d; color: #64b5f6; }
+.badge-reopened {
+    background: #3d2207; color: #ff9800;
+    border: 1px solid #ff9800;
+}
 .badge-time { background: #1a1a3a; color: #666; }
 .badge-processed-btn {
     background: #2e7d32; color: #fff; border: none; cursor: pointer;
@@ -778,6 +880,14 @@ body {
 }
 .badge-cancel-btn:hover { background: #757575; }
 .badge-cancel-btn.visible { display: inline-flex; }
+.badge-reopen-btn {
+    background: #ff9800; color: #1a1a1a; border: none; cursor: pointer;
+    font-size: 11px; padding: 3px 10px; border-radius: 12px; font-weight: 700;
+    display: none; align-items: center; gap: 4px;
+    transition: background 0.15s;
+}
+.badge-reopen-btn:hover { background: #ffb74d; }
+.badge-reopen-btn.visible { display: inline-flex; }
 
 .section-body { padding: 0; }
 
@@ -806,13 +916,21 @@ body {
 .section-body.collapsed { display: none; }
 
 /* ---- grid table ---- */
-.grid-wrap { overflow-x: auto; }
+.grid-wrap {
+    overflow: auto;
+    /* Высота таблицы ограничена, чтобы не выталкивать остальные разделы.
+       Расчёт: viewport − место под шапку, changes-bar и заголовки секций. */
+    max-height: calc(100vh - 240px);
+    max-height: calc(100dvh - 240px);
+    /* Контейнер для sticky-заголовков должен иметь свой stacking context */
+    position: relative;
+}
 .grid {
-    border-collapse: collapse;
+    border-collapse: separate;
+    border-spacing: 0;
     font-size: 13px;
     table-layout: fixed;
     width: 0;
-    border: 2px solid #2a2a5a;
 }
 .grid th {
     background: #12122a;
@@ -823,9 +941,12 @@ body {
     font-weight: 700;
     text-transform: uppercase;
     border: 2px solid #2a2a5a;
-    position: relative;
+    position: sticky;
+    top: 0;
+    z-index: 3;
     min-width: 30px;
 }
+.grid thead th { box-shadow: 0 1px 0 #2a2a5a; }
 .grid th .resize-handle {
     position: absolute;
     right: 0;
@@ -846,7 +967,12 @@ body {
     padding: 9px 10px;
     min-width: 40px;
     border: 2px solid #2a2a5a;
+    position: sticky;
+    left: 0;
+    z-index: 2;
 }
+/* Угловая ячейка должна быть выше всех — пересечение sticky-th и sticky-row-num */
+.grid thead th:first-child { z-index: 4; left: 0; }
 .grid td {
     padding: 8px 14px;
     border: 1px solid #2a2a5a;
@@ -927,6 +1053,17 @@ body {
     font-weight: 700;
     border-left: 4px solid #42a5f5 !important;
 }
+/* Повторно изменённая после отработки/актуализации:
+   красный фон + оранжевая полоса, чтобы отличить от обычной красной */
+.cell-reopened {
+    background: #3d0a0a !important;
+    color: #ffb74d !important;
+    font-weight: 700;
+    border-left: 4px solid #ff9800 !important;
+    box-shadow: inset 2px 0 0 #ff9800;
+    cursor: pointer;
+}
+.cell-reopened:hover { opacity: 0.85; }
 .cell-linkable { cursor: pointer; }
 .cell-linkable:hover { background: rgba(66, 165, 245, 0.15); }
 
@@ -1159,20 +1296,21 @@ body {
         </form>
     </div>
 
-    {% set ns = namespace(total_changed=0, total_processed=0, total_actualized=0) %}
+    {% set ns = namespace(total_changed=0, total_processed=0, total_actualized=0, total_reopened=0) %}
     {% for sec in current.sections %}
         {% set d = sections_data.get(sec.id, {}) %}
-        {% if d.get('changed') %}
-            {% set ns.total_changed = ns.total_changed + d.changed|length %}
-        {% endif %}
-        {% if d.get('processed') %}
-            {% set ns.total_processed = ns.total_processed + d.processed|length %}
-        {% endif %}
-        {% if d.get('actualized') %}
-            {% set ns.total_actualized = ns.total_actualized + d.actualized|length %}
-        {% endif %}
+        {% set ch_set = d.get('changed') or [] %}
+        {% set proc_set = d.get('processed') or [] %}
+        {% set act_set = d.get('actualized') or [] %}
+        {% set reop_set = d.get('reopened') or [] %}
+        {% set ns.total_changed = ns.total_changed + ch_set|length %}
+        {# processed/actualized/reopened учитываем только если ячейка реально в changed #}
+        {% for a in proc_set if a in ch_set %}{% set ns.total_processed = ns.total_processed + 1 %}{% endfor %}
+        {% for a in act_set if a in ch_set %}{% set ns.total_actualized = ns.total_actualized + 1 %}{% endfor %}
+        {% for a in reop_set if a in ch_set %}{% set ns.total_reopened = ns.total_reopened + 1 %}{% endfor %}
     {% endfor %}
     {% set unprocessed = ns.total_changed - ns.total_processed - ns.total_actualized %}
+    {% if unprocessed < 0 %}{% set unprocessed = 0 %}{% endif %}
 
     {% if ns.total_changed > 0 %}
     <div class="changes-bar" id="changesBar">
@@ -1190,6 +1328,13 @@ body {
             <span class="stat-num blue" id="actualizedCount">{{ ns.total_actualized }}</span>
             <span class="stat-label">актуализировано</span>
         </div>
+        {% if ns.total_reopened > 0 %}
+        <div class="divider"></div>
+        <div class="stat" title="Ячейки, которые после отметки 'отработано' или 'актуализировано' снова изменились в Google Sheets">
+            <span class="stat-num" id="reopenedCount" style="color:#ff9800">{{ ns.total_reopened }}</span>
+            <span class="stat-label">повторно</span>
+        </div>
+        {% endif %}
         <div class="divider"></div>
         <div class="stat">
             <span class="stat-num gray">{{ ns.total_changed }}</span>
@@ -1234,6 +1379,7 @@ body {
     {% set data = sections_data.get(sec.id, {}) %}
     {% set proc = data.get('processed', []) %}
     {% set act = data.get('actualized', []) %}
+    {% set reop = data.get('reopened', []) %}
     {% set hidden_cols = data.get('hidden_cols', []) %}
     <div class="section-card" data-sid="{{ sec.id }}" data-pid="{{ current.id }}">
         <div class="section-header">
@@ -1249,22 +1395,30 @@ body {
                     onclick="markSectionActualized(this)">&#9733; Актуально (<span class="sec-act-cnt">0</span>)</button>
                 <button class="badge-cancel-btn" data-sid="{{ sec.id }}"
                     onclick="cancelSelection(this)">&#10005; Отмена (<span class="sec-cancel-cnt">0</span>)</button>
+                <button class="badge-reopen-btn" data-sid="{{ sec.id }}"
+                    onclick="reopenSelection(this)" title="Снять статус 'отработано'/'актуализировано', оставить как новые красные">&#8634; В новые (<span class="sec-reopen-cnt">0</span>)</button>
                 {% if data.get('error') %}
                     <span class="badge badge-changes">ошибка</span>
                 {% elif data.get('first_run') %}
                     <span class="badge badge-first">сохранено</span>
                 {% elif data.get('total', 0) > 0 %}
+                    {% set proc_in_ch = proc|select('in', data.changed)|list %}
+                    {% set act_in_ch = act|select('in', data.changed)|list %}
+                    {% set reop_in_ch = reop|select('in', data.changed)|list %}
                     {% set unproc = data.changed|reject('in', proc)|reject('in', act)|list|length %}
                     {% if unproc > 0 %}
                         <span class="badge badge-changes badge-changes-click" data-sid="{{ sec.id }}" onclick="selectSectionChanged(this)" title="Нажмите чтобы выделить все красные">{{ unproc }} изм.</span>
                     {% else %}
                         <span class="badge badge-ok">OK</span>
                     {% endif %}
-                    {% if proc|length > 0 %}
-                        <span class="badge badge-ok">{{ proc|length }} отр.</span>
+                    {% if reop_in_ch|length > 0 %}
+                        <span class="badge badge-reopened" title="Повторное изменение после отработки/актуализации">{{ reop_in_ch|length }} повт.</span>
                     {% endif %}
-                    {% if act|length > 0 %}
-                        <span class="badge badge-actual">{{ act|length }} акт.</span>
+                    {% if proc_in_ch|length > 0 %}
+                        <span class="badge badge-ok">{{ proc_in_ch|length }} отр.</span>
+                    {% endif %}
+                    {% if act_in_ch|length > 0 %}
+                        <span class="badge badge-actual">{{ act_in_ch|length }} акт.</span>
                     {% endif %}
                 {% elif data.get('checked_at') %}
                     <span class="badge badge-ok">OK</span>
@@ -1332,7 +1486,13 @@ body {
                             {% set col_letter = data.col_headers[loop.index0] %}
                             {% set is_col_hidden = col_letter in hidden_cols %}
                             {% set is_narrow = col_letter > 'C' and col_letter != '' %}
-                            {% if cell.addr in act %}
+                            {% if cell.addr in data.changed and cell.addr in reop %}
+                            <td class="cell-reopened{{ ' col-narrow' if is_narrow else '' }}{{ ' has-link' if cell.link else '' }}{{ ' col-hidden' if is_col_hidden else '' }}"
+                                data-col="{{ col_letter }}"
+                                data-addr="{{ cell.addr }}" data-sid="{{ sec.id }}"
+                                onclick="toggleCellSelect(this, event)"
+                                title="{{ cell.addr }} — повторное изменение после отработки/актуализации">
+                            {% elif cell.addr in data.changed and cell.addr in act %}
                             <td class="cell-actualized{{ ' col-narrow' if is_narrow else '' }}{{ ' has-link' if cell.link else '' }}{{ ' col-hidden' if is_col_hidden else '' }}"
                                 data-col="{{ col_letter }}"
                                 data-addr="{{ cell.addr }}" data-sid="{{ sec.id }}"
@@ -1586,8 +1746,9 @@ function toggleCellSelect(td, ev) {
     var sid = td.getAttribute('data-sid');
     var wasProcessed = td.classList.contains('cell-processed');
     var wasActualized = td.classList.contains('cell-actualized');
+    var wasReopened = td.classList.contains('cell-reopened');
     var wasChanged = td.classList.contains('cell-changed');
-    var wasNormal = !wasProcessed && !wasChanged && !wasActualized;
+    var wasNormal = !wasProcessed && !wasChanged && !wasActualized && !wasReopened;
     var idx = selectedCells.findIndex(function(c) { return c.addr === addr && c.sid === sid; });
     if (idx >= 0) {
         selectedCells.splice(idx, 1);
@@ -1596,20 +1757,24 @@ function toggleCellSelect(td, ev) {
             td.classList.add('cell-processed');
         } else if (td._wasActualized) {
             td.classList.add('cell-actualized');
+        } else if (td._wasReopened) {
+            td.classList.add('cell-reopened');
         } else if (td._wasNormal) {
-            // Обычная ячейка — не добавляем ничего
+            // ничего
         } else {
             td.classList.add('cell-changed');
         }
         td._wasProcessed = false;
         td._wasActualized = false;
+        td._wasReopened = false;
         td._wasNormal = false;
     } else {
         td._wasProcessed = wasProcessed;
         td._wasActualized = wasActualized;
+        td._wasReopened = wasReopened;
         td._wasNormal = wasNormal;
         selectedCells.push({addr: addr, sid: sid, el: td});
-        td.classList.remove('cell-changed', 'cell-processed', 'cell-actualized', 'cell-linkable');
+        td.classList.remove('cell-changed', 'cell-processed', 'cell-actualized', 'cell-reopened', 'cell-linkable');
         td.classList.add('cell-selected');
     }
     updateSelectedUI();
@@ -1656,24 +1821,42 @@ function updateSelectedUI() {
             b.classList.remove('visible');
         }
     });
+    // Кнопка "В новые" — только если среди выделенных есть processed/actualized
+    var reopenBySid = {};
+    selectedCells.forEach(function(c) {
+        if (c.el._wasProcessed || c.el._wasActualized) {
+            reopenBySid[c.sid] = (reopenBySid[c.sid] || 0) + 1;
+        }
+    });
+    document.querySelectorAll('.badge-reopen-btn').forEach(function(b) {
+        var sid = b.getAttribute('data-sid');
+        var n = reopenBySid[sid] || 0;
+        var span = b.querySelector('.sec-reopen-cnt');
+        if (span) span.textContent = n;
+        if (n > 0) {
+            b.classList.add('visible');
+        } else {
+            b.classList.remove('visible');
+        }
+    });
 }
 
 function selectSectionChanged(badge) {
     var sid = badge.getAttribute('data-sid');
     var section = document.querySelector('.section-card[data-sid="' + sid + '"]');
     if (!section) return;
-    // Выделяем все красные ячейки в этом разделе
-    section.querySelectorAll('.cell-changed').forEach(function(td) {
+    // Выделяем все красные и повторные (reopened) ячейки в этом разделе
+    section.querySelectorAll('.cell-changed, .cell-reopened').forEach(function(td) {
         var addr = td.getAttribute('data-addr');
         if (!addr) return;
-        // Пропускаем если уже выделена
         var idx = selectedCells.findIndex(function(c) { return c.addr === addr && c.sid === sid; });
         if (idx >= 0) return;
         td._wasProcessed = false;
         td._wasActualized = false;
+        td._wasReopened = td.classList.contains('cell-reopened');
         td._wasNormal = false;
         selectedCells.push({addr: addr, sid: sid, el: td});
-        td.classList.remove('cell-changed');
+        td.classList.remove('cell-changed', 'cell-reopened');
         td.classList.add('cell-selected');
     });
     updateSelectedUI();
@@ -1695,23 +1878,26 @@ function selectAllChanged() {
         c.el.classList.remove('cell-selected');
         if (c.el._wasProcessed) c.el.classList.add('cell-processed');
         else if (c.el._wasActualized) c.el.classList.add('cell-actualized');
+        else if (c.el._wasReopened) c.el.classList.add('cell-reopened');
         else if (c.el._wasNormal) { /* ничего */ }
         else c.el.classList.add('cell-changed');
         c.el._wasProcessed = false;
         c.el._wasActualized = false;
+        c.el._wasReopened = false;
         c.el._wasNormal = false;
     });
     selectedCells = [];
-    // Выделяем все красные (cell-changed) ячейки во всех разделах
-    document.querySelectorAll('.cell-changed').forEach(function(td) {
+    // Выделяем все красные и повторные ячейки во всех разделах
+    document.querySelectorAll('.cell-changed, .cell-reopened').forEach(function(td) {
         var addr = td.getAttribute('data-addr');
         var sid = td.getAttribute('data-sid');
         if (!addr || !sid) return;
         td._wasProcessed = false;
         td._wasActualized = false;
+        td._wasReopened = td.classList.contains('cell-reopened');
         td._wasNormal = false;
         selectedCells.push({addr: addr, sid: sid, el: td});
-        td.classList.remove('cell-changed');
+        td.classList.remove('cell-changed', 'cell-reopened');
         td.classList.add('cell-selected');
     });
     updateSelectedUI();
@@ -1733,9 +1919,10 @@ function cancelSelection(btn) {
         body: JSON.stringify({cells: addrs})
     }).then(function() {
         sectionCells.forEach(function(c) {
-            c.el.classList.remove('cell-selected', 'cell-changed', 'cell-processed', 'cell-actualized', 'cell-linkable');
+            c.el.classList.remove('cell-selected', 'cell-changed', 'cell-processed', 'cell-actualized', 'cell-reopened', 'cell-linkable');
             c.el._wasProcessed = false;
             c.el._wasActualized = false;
+            c.el._wasReopened = false;
             c.el._wasNormal = false;
         });
         selectedCells = selectedCells.filter(function(c) { return c.sid !== sid; });
@@ -1755,6 +1942,58 @@ function cancelSelection(btn) {
     });
 }
 
+function reopenSelection(btn) {
+    var sid = btn.getAttribute('data-sid');
+    // Берём только выделенные ячейки, которые ДО выделения были processed/actualized
+    var sectionCells = selectedCells.filter(function(c) {
+        return c.sid === sid && (c.el._wasProcessed || c.el._wasActualized);
+    });
+    if (sectionCells.length === 0) return;
+
+    var addrs = sectionCells.map(function(c) { return c.addr; });
+    var card = btn.closest('.section-card');
+    var pid = card ? card.getAttribute('data-pid') : projectId;
+
+    fetch('/project/' + pid + '/section/' + sid + '/reopen', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({cells: addrs})
+    }).then(function() {
+        var movedCount = sectionCells.length;
+        var processedDelta = 0;
+        var actualizedDelta = 0;
+        sectionCells.forEach(function(c) {
+            if (c.el._wasProcessed) processedDelta += 1;
+            if (c.el._wasActualized) actualizedDelta += 1;
+            c.el.classList.remove('cell-selected', 'cell-processed', 'cell-actualized', 'cell-reopened');
+            c.el.classList.add('cell-changed');
+            c.el._wasProcessed = false;
+            c.el._wasActualized = false;
+            c.el._wasReopened = false;
+            c.el._wasNormal = false;
+            c.el.title = c.addr + ' (кликните для выделения)';
+        });
+
+        // Удаляем эти ячейки из selectedCells
+        var movedAddrs = {};
+        sectionCells.forEach(function(c) { movedAddrs[c.addr] = true; });
+        selectedCells = selectedCells.filter(function(c) {
+            return !(c.sid === sid && movedAddrs[c.addr]);
+        });
+
+        // Обновляем общие счётчики
+        var processedEl = document.getElementById('processedCount');
+        var actualizedEl = document.getElementById('actualizedCount');
+        var unprocessedEl = document.getElementById('unprocessedCount');
+        if (processedEl) processedEl.textContent = Math.max(0, parseInt(processedEl.textContent) - processedDelta);
+        if (actualizedEl) actualizedEl.textContent = Math.max(0, parseInt(actualizedEl.textContent) - actualizedDelta);
+        if (unprocessedEl) unprocessedEl.textContent = parseInt(unprocessedEl.textContent) + movedCount;
+
+        _updateSectionBadges(sid);
+        updateSelectedUI();
+    });
+}
+
 function markSectionProcessed(btn) {
     var sid = btn.getAttribute('data-sid');
     var sectionCells = selectedCells.filter(function(c) { return c.sid === sid; });
@@ -1767,7 +2006,7 @@ function markSectionProcessed(btn) {
         body: JSON.stringify({cells: addrs})
     }).then(function() {
         sectionCells.forEach(function(c) {
-            c.el.classList.remove('cell-selected', 'cell-changed', 'cell-actualized');
+            c.el.classList.remove('cell-selected', 'cell-changed', 'cell-actualized', 'cell-reopened');
             c.el.classList.add('cell-processed');
             c.el.setAttribute('onclick', 'toggleCellSelect(this, event)');
             c.el.title = c.addr + ' (отработано, кликните для смены статуса)';
@@ -1801,7 +2040,7 @@ function markSectionActualized(btn) {
         body: JSON.stringify({cells: addrs})
     }).then(function() {
         sectionCells.forEach(function(c) {
-            c.el.classList.remove('cell-selected', 'cell-changed', 'cell-processed', 'cell-linkable');
+            c.el.classList.remove('cell-selected', 'cell-changed', 'cell-processed', 'cell-reopened', 'cell-linkable');
             c.el.classList.add('cell-actualized');
             c.el.setAttribute('onclick', 'toggleCellSelect(this, event)');
             c.el.title = c.addr + ' (актуализировано, кликните для смены статуса)';
@@ -1809,10 +2048,14 @@ function markSectionActualized(btn) {
 
         selectedCells = selectedCells.filter(function(c) { return c.sid !== sid; });
 
-        // Обновляем общий счётчик актуализированных
+        // Обновляем счётчик актуализированных + не-отработано (т.к. ячейка ушла из красного)
         var actualizedEl = document.getElementById('actualizedCount');
+        var unprocessedEl = document.getElementById('unprocessedCount');
         if (actualizedEl) {
             actualizedEl.textContent = parseInt(actualizedEl.textContent) + sectionCells.length;
+        }
+        if (unprocessedEl) {
+            unprocessedEl.textContent = Math.max(0, parseInt(unprocessedEl.textContent) - sectionCells.length);
         }
 
         _updateSectionBadges(sid);
@@ -1828,23 +2071,33 @@ function _updateSectionBadges(sid) {
     if (!badges || !grid) return;
 
     var changedCount = grid.querySelectorAll('.cell-changed').length;
+    var reopenedCount = grid.querySelectorAll('.cell-reopened').length;
     var processedCount = grid.querySelectorAll('.cell-processed').length;
     var actualizedCount = grid.querySelectorAll('.cell-actualized').length;
 
-    var oldBadges = badges.querySelectorAll('.badge-changes, .badge-ok, .badge-actual');
+    var oldBadges = badges.querySelectorAll('.badge-changes, .badge-ok, .badge-actual, .badge-reopened');
     oldBadges.forEach(function(b) { b.remove(); });
 
     var timeBadge = badges.querySelector('.badge-time');
     var insertBefore = timeBadge || badges.querySelector('form');
 
-    if (changedCount > 0) {
+    // unproc = красные + повторные (всё что ещё не отработано)
+    var unprocCount = changedCount + reopenedCount;
+    if (unprocCount > 0) {
         var b = document.createElement('span');
         b.className = 'badge badge-changes badge-changes-click';
         b.setAttribute('data-sid', sid);
         b.setAttribute('title', 'Нажмите чтобы выделить все красные');
         b.onclick = function() { selectSectionChanged(b); };
-        b.textContent = changedCount + ' изм.';
+        b.textContent = unprocCount + ' изм.';
         badges.insertBefore(b, insertBefore);
+    }
+    if (reopenedCount > 0) {
+        var br = document.createElement('span');
+        br.className = 'badge badge-reopened';
+        br.setAttribute('title', 'Повторное изменение после отработки/актуализации');
+        br.textContent = reopenedCount + ' повт.';
+        badges.insertBefore(br, insertBefore);
     }
     if (processedCount > 0) {
         var b2 = document.createElement('span');
@@ -1858,7 +2111,7 @@ function _updateSectionBadges(sid) {
         b3.textContent = actualizedCount + ' акт.';
         badges.insertBefore(b3, insertBefore);
     }
-    if (changedCount === 0) {
+    if (unprocCount === 0) {
         var b4 = document.createElement('span');
         b4.className = 'badge badge-ok';
         b4.textContent = 'OK';
@@ -1952,6 +2205,11 @@ def _do_auto_check():
                 continue
 
             all_changes = load_changes()
+            processed_all = load_processed()
+            actualized_all = load_actualized()
+            hidden_all = load_hidden_cols()
+            processed_dirty = False
+            actualized_dirty = False
 
             for idx, sec in enumerate(proj["sections"]):
                 if idx > 0:
@@ -1965,8 +2223,11 @@ def _do_auto_check():
                         client, sp_id, gid, sec["range"]
                     )
 
-                    changes_key = f"{pid}:{sec['id']}"
-                    saved_changes = set(all_changes.get(changes_key, []))
+                    sec_key = f"{pid}:{sec['id']}"
+                    saved_changes = set(all_changes.get(sec_key, []))
+                    proc_set = set(processed_all.get(sec_key, []))
+                    act_set = set(actualized_all.get(sec_key, []))
+                    reopened_set = set(sc.get(sec["id"], {}).get("reopened", []))
 
                     if not first_run:
                         for key, new_val in flat.items():
@@ -1974,26 +2235,32 @@ def _do_auto_check():
                             if old_val is not None and old_val != new_val:
                                 addr = key.split("!", 1)[1]
                                 saved_changes.add(addr)
+                                was_proc = addr in proc_set
+                                was_act = addr in act_set
+                                if was_proc:
+                                    proc_set.discard(addr)
+                                    processed_dirty = True
+                                if was_act:
+                                    act_set.discard(addr)
+                                    actualized_dirty = True
+                                if was_proc or was_act:
+                                    reopened_set.add(addr)
 
-                    all_changes[changes_key] = list(saved_changes)
+                    all_changes[sec_key] = list(saved_changes)
+                    processed_all[sec_key] = list(proc_set)
+                    actualized_all[sec_key] = list(act_set)
                     changed = list(saved_changes)
                     new_snapshot.update(flat)
-
-                    processed = load_processed()
-                    proc_list = processed.get(f"{pid}:{sec['id']}", [])
-                    hidden = load_hidden_cols()
-                    hidden_list = hidden.get(f"{pid}:{sec['id']}", [])
-                    act = load_actualized()
-                    act_list = act.get(f"{pid}:{sec['id']}", [])
 
                     sc[sec["id"]] = {
                         "sheet_title": sheet_title,
                         "col_headers": col_headers,
                         "rows": rows,
                         "changed": changed,
-                        "processed": proc_list,
-                        "actualized": act_list,
-                        "hidden_cols": hidden_list,
+                        "processed": list(proc_set),
+                        "actualized": list(act_set),
+                        "reopened": list(reopened_set),
+                        "hidden_cols": hidden_all.get(sec_key, []),
                         "total": len(changed),
                         "checked_at": datetime.now().strftime("%H:%M:%S"),
                         "first_run": first_run,
@@ -2003,6 +2270,10 @@ def _do_auto_check():
                     pass
 
             save_changes(all_changes)
+            if processed_dirty:
+                save_processed(processed_all)
+            if actualized_dirty:
+                save_actualized(actualized_all)
             save_snapshot(new_snapshot)
             save_section_cache(sc)
 
