@@ -2199,13 +2199,14 @@ def _do_auto_check():
         cfg = load_config()
         try:
             client = get_client()
-        except Exception:
+        except Exception as e:
+            logger.error("Auto-check: не удалось получить Google Sheets client: %s", e)
             return
         for proj in cfg.get("projects", []):
             try:
                 _run_project_check(client, proj)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.exception("Auto-check: ошибка при проверке проекта %s: %s", proj.get("id"), e)
             time.sleep(5)  # пауза между проектами
     except Exception:
         pass

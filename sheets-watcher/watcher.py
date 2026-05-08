@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sys
 from datetime import datetime
@@ -8,6 +9,8 @@ import gspread
 from gspread.exceptions import APIError, SpreadsheetNotFound
 from gspread.utils import rowcol_to_a1
 from google.oauth2.service_account import Credentials
+
+logger = logging.getLogger(__name__)
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets.readonly",
@@ -23,23 +26,43 @@ CREDENTIALS_PATH = PROJECT_DIR / "credentials.json"
 
 
 def get_client() -> gspread.Client:
-    # Vercel / serverless: credentials из env variable (JSON-строка)
-    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+    """Авторизация в Google Sheets API.
+
+    Порядок выбора источника credentials:
+      1. GOOGLE_CREDENTIALS_JSON (env, JSON-строка) — основной для production/Vercel
+      2. GOOGLE_CREDENTIALS (env, JSON-строка) — legacy, оставлено для обратной совместимости
+      3. credentials.json (файл рядом с модулем) — для локальной разработки
+
+    При ошибке поднимается RuntimeError с понятным сообщением, БЕЗ содержимого ключа.
+    """
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON") or os.environ.get("GOOGLE_CREDENTIALS")
     if creds_json:
-        info = json.loads(creds_json)
+        try:
+            info = json.loads(creds_json)
+        except json.JSONDecodeError as exc:
+            # Не логируем сам creds_json — чтобы случайно не утёк в логи
+            raise RuntimeError(
+                "GOOGLE_CREDENTIALS_JSON не является валидным JSON. "
+                f"Ошибка парсинга на позиции {exc.pos}. "
+                "Проверьте, что переменная окружения содержит полный service account JSON."
+            ) from None
         creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+        logger.info("Google Sheets: используются credentials из env (%s)",
+                    "GOOGLE_CREDENTIALS_JSON" if os.environ.get("GOOGLE_CREDENTIALS_JSON") else "GOOGLE_CREDENTIALS")
         return gspread.authorize(creds)
 
-    # Локальный запуск: credentials из файла
-    if not CREDENTIALS_PATH.exists():
-        sys.exit(
-            f"[ОШИБКА] Файл {CREDENTIALS_PATH} не найден.\n"
-            "Скачайте JSON-ключ сервисного аккаунта из Google Cloud Console "
-            "и положите его в корень проекта под именем credentials.json."
-        )
+    # Локальная разработка: credentials из файла
+    if CREDENTIALS_PATH.exists():
+        creds = Credentials.from_service_account_file(CREDENTIALS_PATH, scopes=SCOPES)
+        logger.info("Google Sheets: используются credentials из файла %s", CREDENTIALS_PATH)
+        return gspread.authorize(creds)
 
-    creds = Credentials.from_service_account_file(CREDENTIALS_PATH, scopes=SCOPES)
-    return gspread.authorize(creds)
+    raise RuntimeError(
+        "Google Sheets credentials не найдены. "
+        "На production задайте переменную окружения GOOGLE_CREDENTIALS_JSON "
+        "(полный JSON service-account, одной строкой). "
+        f"Для локальной разработки положите credentials.json рядом с {Path(__file__).name}."
+    )
 
 
 def read_ranges(
