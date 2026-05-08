@@ -17,13 +17,16 @@ python sheets-watcher/app.py
 
 # Запуск CLI-проверки (вывод изменений в консоль)
 python sheets-watcher/watcher.py
+
+# Деплой на сервер (Windows bat-скрипт, загружает через SCP + перезапускает systemd)
+sheets-watcher/deploy.bat
 ```
 
 ## Архитектура
 
 Два режима работы: веб-интерфейс и CLI. `app.py` импортирует `get_client` из `watcher.py` для авторизации Google API.
 
-- **`app.py`** — Flask single-page приложение с inline Jinja2-шаблоном (HTML/CSS/JS в одном файле). Управление проектами и разделами через UI. При "Проверить все" читает ячейки через Sheets API v4, сравнивает со снимком, подсвечивает изменённые ячейки красным. Поддерживает отметку обработанных ячеек (зелёный) и скрытие столбцов.
+- **`app.py`** — Flask single-page приложение с inline Jinja2-шаблоном (HTML/CSS/JS в одном файле, ~2200 строк). Управление проектами и разделами через UI. При "Проверить все" читает ячейки через Sheets API v4, сравнивает со снимком, подсвечивает изменённые ячейки красным. Поддерживает отметку обработанных (зелёный), актуализированных ячеек, скрытие столбцов и сброс изменений. Включает фоновый планировщик (`_schedule_loop`) — автопроверку всех проектов ежедневно в 06:00.
 
 - **`watcher.py`** — CLI-режим и библиотека. Авторизация через сервисный аккаунт (`get_client`), чтение диапазонов (`read_ranges`), снимки (`load_snapshot`/`save_snapshot`), сравнение (`compare`), отчёт (`print_report`).
 
@@ -60,6 +63,9 @@ python sheets-watcher/watcher.py
 | `/project/<pid>/section/<sid>/mark-processed` | POST | Отметить ячейки обработанными (JSON) |
 | `/project/<pid>/section/<sid>/hide-cols` | POST | Скрыть столбцы (JSON) |
 | `/project/<pid>/section/<sid>/unhide-cols` | POST | Показать скрытые столбцы (JSON) |
+| `/project/<pid>/section/<sid>/mark-actualized` | POST | Отметить ячейки актуализированными (JSON) |
+| `/project/<pid>/section/<sid>/dismiss-changes` | POST | Сбросить изменения для раздела (JSON) |
+| `/project/<pid>/rename` | POST | Переименовать проект |
 
 ### Особенности
 
@@ -69,3 +75,6 @@ python sheets-watcher/watcher.py
 - ID проектов/разделов генерируются как `uuid.uuid4().hex[:8]`.
 - Python 3.12+ (используется синтаксис `type | None`).
 - `credentials.json` — ключ сервисного аккаунта Google, НЕ коммитить.
+- **Безопасная запись `data.json`**: `save_data()` в `app.py` делает атомарную запись через tmp-файл + `Path.replace()`, плюс автобэкап в `data.backup.json` и ежедневный бэкап в `backups/`.
+- Между запросами к разным разделам Google API — пауза `time.sleep(3)`, между проектами — `time.sleep(5)` (защита от rate-limit).
+- На сервере приложение работает как systemd-сервис `sheets-watcher` (порт 5000).

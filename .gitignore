@@ -24,5 +24,9 @@ sheets-watcher/changes.json
 sheets-watcher/last_check.json
 sheets-watcher/actualized.json
 
+# Backup
+sheets-watcher/data.backup.json
+sheets-watcher/backups/
+
 # IDE / Claude
 .claude/

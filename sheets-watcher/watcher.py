@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -19,11 +20,17 @@ else:
     PROJECT_DIR = Path(__file__).parent
 
 CREDENTIALS_PATH = PROJECT_DIR / "credentials.json"
-DATA_PATH = PROJECT_DIR / "data.json"
-CONFIG_PATH = PROJECT_DIR / "config.json"  # fallback для CLI
 
 
 def get_client() -> gspread.Client:
+    # Vercel / serverless: credentials из env variable (JSON-строка)
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+    if creds_json:
+        info = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+        return gspread.authorize(creds)
+
+    # Локальный запуск: credentials из файла
     if not CREDENTIALS_PATH.exists():
         sys.exit(
             f"[ОШИБКА] Файл {CREDENTIALS_PATH} не найден.\n"
@@ -73,36 +80,9 @@ def read_ranges(
     return result
 
 
-# --------------- snapshot ---------------
+# --------------- snapshot (Supabase) ---------------
 
-def _load_data() -> dict:
-    """Читает единый data.json."""
-    if not DATA_PATH.exists():
-        return {}
-    try:
-        return json.loads(DATA_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def _save_data(data: dict) -> None:
-    DATA_PATH.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-
-def load_snapshot() -> dict[str, str]:
-    """Читает snapshot из data.json."""
-    data = _load_data()
-    return data.get("snapshot", {})
-
-
-def save_snapshot(data: dict[str, str]) -> None:
-    """Сохраняет snapshot в data.json."""
-    d = _load_data()
-    d["snapshot"] = data
-    _save_data(d)
+from db import load_snapshot, save_snapshot, load_config as _db_load_config
 
 
 def compare(
@@ -157,20 +137,21 @@ def print_report(spreadsheet_name: str, changes: list[dict[str, str | None]]) ->
 
 # --------------- main ---------------
 
+def _parse_spreadsheet_id(url: str) -> str | None:
+    """Извлекает spreadsheet ID из URL Google Sheets."""
+    import re
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url)
+    return m.group(1) if m else None
+
+
 def main() -> None:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n[{now}] Запуск проверки таблиц...")
 
-    if not DATA_PATH.exists() and not CONFIG_PATH.exists():
-        sys.exit(f"[ОШИБКА] Файл {DATA_PATH} не найден.")
-
-    data = _load_data()
-    config = data.get("config", {})
-    if not config and CONFIG_PATH.exists():
-        try:
-            config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as e:
-            sys.exit(f"[ОШИБКА] config.json повреждён: {e}")
+    config = _db_load_config()
+    projects = config.get("projects", [])
+    if not projects:
+        sys.exit("[ОШИБКА] Нет проектов в конфигурации.")
 
     old_snapshot = load_snapshot()
     first_run = not old_snapshot
@@ -179,38 +160,37 @@ def main() -> None:
 
     new_snapshot: dict[str, str] = {}
     total_changes = 0
-    tables_with_changes = 0
+    total_sections = 0
 
-    for sheet_cfg in config["spreadsheets"]:
-        name = sheet_cfg["name"]
-        sid = sheet_cfg["id"]
-        ranges = sheet_cfg["ranges"]
-        sheet_name = sheet_cfg.get("sheet")
+    for proj in projects:
+        for sec in proj.get("sections", []):
+            total_sections += 1
+            sp_id = _parse_spreadsheet_id(sec["url"])
+            if not sp_id:
+                print(f"[ПРЕДУПРЕЖДЕНИЕ] Невалидный URL в разделе «{sec['name']}»")
+                continue
 
-        data = read_ranges(client, sid, ranges, sheet_name)
+            ranges = [r.strip() for r in sec["range"].split(",") if r.strip()]
+            data = read_ranges(client, sp_id, ranges)
 
-        # Ключи snapshot хранятся с префиксом id таблицы,
-        # чтобы не перепутать ячейки из разных таблиц.
-        prefixed = {f"{sid}!{addr}": val for addr, val in data.items()}
-        new_snapshot.update(prefixed)
+            prefixed = {f"{sp_id}!{addr}": val for addr, val in data.items()}
+            new_snapshot.update(prefixed)
 
-        if first_run:
-            continue
+            if first_run:
+                continue
 
-        old_for_sheet = {
-            k: v for k, v in old_snapshot.items() if k.startswith(f"{sid}!")
-        }
+            old_for_sheet = {
+                k: v for k, v in old_snapshot.items() if k.startswith(f"{sp_id}!")
+            }
 
-        changes = compare(old_for_sheet, prefixed)
+            changes = compare(old_for_sheet, prefixed)
 
-        # В отчёте показываем адреса без префикса id
-        for ch in changes:
-            ch["cell"] = ch["cell"].split("!", 1)[1]
+            for ch in changes:
+                ch["cell"] = ch["cell"].split("!", 1)[1]
 
-        print_report(name, changes)
-        total_changes += len(changes)
-        if changes:
-            tables_with_changes += 1
+            section_name = f"{proj['name']} / {sec['name']}"
+            print_report(section_name, changes)
+            total_changes += len(changes)
 
     save_snapshot(new_snapshot)
 
@@ -218,8 +198,7 @@ def main() -> None:
     if first_run:
         print("Первый запуск, состояние сохранено.")
     else:
-        print(f"Итого: {total_changes} изм. в {tables_with_changes} табл. "
-              f"из {len(config['spreadsheets'])}.")
+        print(f"Итого: {total_changes} изм. в {total_sections} разделах.")
 
     print()
 

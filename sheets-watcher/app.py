@@ -1,13 +1,10 @@
-import json
-import os
+import logging
 import re
-import sys
 import time
 import uuid
 import webbrowser
 import threading
 from datetime import datetime
-from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from flask import Flask, render_template_string, redirect, url_for, request, jsonify
@@ -15,132 +12,21 @@ from flask import Flask, render_template_string, redirect, url_for, request, jso
 from gspread.utils import rowcol_to_a1
 
 from watcher import get_client
+from db import (
+    load_config, save_config, find_project,
+    load_snapshot, save_snapshot,
+    load_processed, save_processed,
+    load_changes, save_changes,
+    load_actualized, save_actualized,
+    load_hidden_cols, save_hidden_cols,
+    load_last_check, save_last_check,
+    load_section_cache, save_section_cache,
+)
 
 app = Flask(__name__)
 
-# При сборке PyInstaller: sys.executable указывает на .exe,
-# данные храним рядом с ним. При обычном запуске — рядом со скриптом.
-if getattr(sys, 'frozen', False):
-    PROJECT_DIR = Path(sys.executable).parent
-else:
-    PROJECT_DIR = Path(__file__).parent
-
-DATA_PATH = PROJECT_DIR / "data.json"
-
-# Пути старых файлов — для автомиграции
-_OLD_FILES = {
-    "config": PROJECT_DIR / "config.json",
-    "snapshot": PROJECT_DIR / "snapshot.json",
-    "processed": PROJECT_DIR / "processed.json",
-    "actualized": PROJECT_DIR / "actualized.json",
-    "changes": PROJECT_DIR / "changes.json",
-    "hidden_cols": PROJECT_DIR / "hidden_cols.json",
-    "last_check": PROJECT_DIR / "last_check.json",
-    "cache": PROJECT_DIR / "cache.json",
-}
-
-_DATA_DEFAULTS = {
-    "config": {"projects": []},
-    "snapshot": {},
-    "processed": {},
-    "actualized": {},
-    "changes": {},
-    "hidden_cols": {},
-    "last_check": {},
-    "cache": {},
-}
-
-
-def _migrate_to_single_file() -> None:
-    """При первом запуске: собирает старые JSON-файлы в единый data.json."""
-    if DATA_PATH.exists():
-        return
-    data = {}
-    for key, path in _OLD_FILES.items():
-        if path.exists():
-            try:
-                data[key] = json.loads(path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                data[key] = _DATA_DEFAULTS[key]
-        else:
-            data[key] = _DATA_DEFAULTS[key]
-    save_data(data)
-    # Удаляем старые файлы после успешной миграции
-    for key, path in _OLD_FILES.items():
-        if path.exists():
-            path.unlink()
-
-
-def load_data() -> dict:
-    if not DATA_PATH.exists():
-        return {k: dict(v) if isinstance(v, dict) else v for k, v in _DATA_DEFAULTS.items()}
-    try:
-        data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {k: dict(v) if isinstance(v, dict) else v for k, v in _DATA_DEFAULTS.items()}
-    for key, default in _DATA_DEFAULTS.items():
-        if key not in data:
-            data[key] = default
-    return data
-
-
-def save_data(data: dict) -> None:
-    DATA_PATH.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-
-# --------------- helpers ---------------
-
-def load_hidden_cols() -> dict:
-    return load_data()["hidden_cols"]
-
-def save_hidden_cols(data: dict) -> None:
-    d = load_data(); d["hidden_cols"] = data; save_data(d)
-
-def load_processed() -> dict:
-    return load_data()["processed"]
-
-def save_processed(data: dict) -> None:
-    d = load_data(); d["processed"] = data; save_data(d)
-
-def load_changes() -> dict:
-    return load_data()["changes"]
-
-def save_changes(data: dict) -> None:
-    d = load_data(); d["changes"] = data; save_data(d)
-
-def load_config() -> dict:
-    return load_data()["config"]
-
-def save_config(cfg: dict) -> None:
-    d = load_data(); d["config"] = cfg; save_data(d)
-
-def load_actualized() -> dict:
-    return load_data()["actualized"]
-
-def save_actualized(data: dict) -> None:
-    d = load_data(); d["actualized"] = data; save_data(d)
-
-def load_last_check() -> dict:
-    return load_data()["last_check"]
-
-def save_last_check(data: dict) -> None:
-    d = load_data(); d["last_check"] = data; save_data(d)
-
-def load_snapshot() -> dict:
-    return load_data()["snapshot"]
-
-def save_snapshot(data: dict) -> None:
-    d = load_data(); d["snapshot"] = data; save_data(d)
-
-
-def find_project(cfg, pid):
-    for p in cfg["projects"]:
-        if p["id"] == pid:
-            return p
-    return None
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
 
 def parse_url(url: str) -> tuple[str | None, int | None]:
@@ -263,14 +149,6 @@ def read_grid(client, spreadsheet_id, gid, range_str):
         rows.append({"num": row, "cells": row_cells})
 
     return sheet_title, col_headers, rows, flat
-
-
-# Кеш результатов по секциям
-def load_section_cache() -> dict:
-    return load_data()["cache"]
-
-def save_section_cache(data: dict) -> None:
-    d = load_data(); d["cache"] = data; save_data(d)
 
 
 # --------------- routes ---------------
@@ -571,6 +449,37 @@ def mark_actualized(pid, sid):
     return jsonify(ok=True)
 
 
+@app.route("/project/<pid>/section/<sid>/dismiss-changes", methods=["POST"])
+def dismiss_changes(pid, sid):
+    """Убирает выбранные ячейки из списка изменений (навсегда)."""
+    data = request.get_json(force=True)
+    cells = data.get("cells", [])
+    if not cells:
+        return jsonify(ok=False)
+
+    key = f"{pid}:{sid}"
+    cells_set = set(cells)
+
+    # Удаляем из changes
+    all_changes = load_changes()
+    if key in all_changes:
+        all_changes[key] = [c for c in all_changes[key] if c not in cells_set]
+        save_changes(all_changes)
+
+    # Обновляем snapshot: ставим текущее значение чтобы при следующей проверке не считалось изменением
+    # (ничего не делаем — snapshot уже актуален)
+
+    # Удаляем из кеша
+    sc = load_section_cache()
+    if sid in sc:
+        if "changed" in sc[sid]:
+            sc[sid]["changed"] = [c for c in sc[sid]["changed"] if c not in cells_set]
+            sc[sid]["total"] = len(sc[sid]["changed"])
+        save_section_cache(sc)
+
+    return jsonify(ok=True)
+
+
 @app.route("/project/<pid>/section/<sid>/hide-cols", methods=["POST"])
 def hide_cols(pid, sid):
     data = request.get_json(force=True)
@@ -840,6 +749,8 @@ body {
 }
 .badge-ok { background: #0a3d2a; color: #4caf50; }
 .badge-changes { background: #3d0a0a; color: #ff6b6b; }
+.badge-changes-click { cursor: pointer; transition: background 0.2s, transform 0.1s; }
+.badge-changes-click:hover { background: #5a1010; transform: scale(1.05); }
 .badge-first { background: #3d2e0a; color: #ff9800; }
 .badge-actual { background: #0a1a3d; color: #64b5f6; }
 .badge-time { background: #1a1a3a; color: #666; }
@@ -1107,6 +1018,29 @@ body {
     height: 30px;
     background: #2a2a4a;
 }
+.stat-clickable {
+    cursor: pointer;
+    border-radius: 6px;
+    padding: 4px 8px;
+    transition: background 0.2s;
+}
+.stat-clickable:hover { background: rgba(255,107,107,0.15); }
+.btn-select-all-changed {
+    background: #ff6b6b;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 14px;
+    margin-left: 12px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+    white-space: nowrap;
+    transition: background 0.2s, opacity 0.2s;
+    animation: fadeIn 0.2s ease;
+}
+.btn-select-all-changed:hover { background: #e55a5a; }
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 
 /* ---- section edit form ---- */
 .sec-edit-btn {
@@ -1242,7 +1176,7 @@ body {
 
     {% if ns.total_changed > 0 %}
     <div class="changes-bar" id="changesBar">
-        <div class="stat">
+        <div class="stat stat-clickable" onclick="toggleSelectAllBtn()" title="Нажмите чтобы выделить все красные">
             <span class="stat-num red" id="unprocessedCount">{{ unprocessed if unprocessed > 0 else 0 }}</span>
             <span class="stat-label">не отработано</span>
         </div>
@@ -1261,6 +1195,7 @@ body {
             <span class="stat-num gray">{{ ns.total_changed }}</span>
             <span class="stat-label">всего изменений</span>
         </div>
+        <button class="btn btn-select-all-changed" id="selectAllChangedBtn" onclick="selectAllChanged()" style="display:none" title="Выделить все красные ячейки во всех разделах">&#10003; Выделить все красные</button>
     </div>
     {% endif %}
 
@@ -1321,7 +1256,7 @@ body {
                 {% elif data.get('total', 0) > 0 %}
                     {% set unproc = data.changed|reject('in', proc)|reject('in', act)|list|length %}
                     {% if unproc > 0 %}
-                        <span class="badge badge-changes">{{ unproc }} изм.</span>
+                        <span class="badge badge-changes badge-changes-click" data-sid="{{ sec.id }}" onclick="selectSectionChanged(this)" title="Нажмите чтобы выделить все красные">{{ unproc }} изм.</span>
                     {% else %}
                         <span class="badge badge-ok">OK</span>
                     {% endif %}
@@ -1723,18 +1658,101 @@ function updateSelectedUI() {
     });
 }
 
-function cancelSelection(btn) {
-    var sid = btn.getAttribute('data-sid');
-    var sectionCells = selectedCells.filter(function(c) { return c.sid === sid; });
-    if (sectionCells.length === 0) return;
-    sectionCells.forEach(function(c) {
-        c.el.classList.remove('cell-selected', 'cell-changed', 'cell-processed', 'cell-actualized', 'cell-linkable');
+function selectSectionChanged(badge) {
+    var sid = badge.getAttribute('data-sid');
+    var section = document.querySelector('.section-card[data-sid="' + sid + '"]');
+    if (!section) return;
+    // Выделяем все красные ячейки в этом разделе
+    section.querySelectorAll('.cell-changed').forEach(function(td) {
+        var addr = td.getAttribute('data-addr');
+        if (!addr) return;
+        // Пропускаем если уже выделена
+        var idx = selectedCells.findIndex(function(c) { return c.addr === addr && c.sid === sid; });
+        if (idx >= 0) return;
+        td._wasProcessed = false;
+        td._wasActualized = false;
+        td._wasNormal = false;
+        selectedCells.push({addr: addr, sid: sid, el: td});
+        td.classList.remove('cell-changed');
+        td.classList.add('cell-selected');
+    });
+    updateSelectedUI();
+}
+
+function toggleSelectAllBtn() {
+    var btn = document.getElementById('selectAllChangedBtn');
+    if (!btn) return;
+    if (btn.style.display === 'none') {
+        btn.style.display = '';
+    } else {
+        btn.style.display = 'none';
+    }
+}
+
+function selectAllChanged() {
+    // Снимаем текущее выделение
+    selectedCells.forEach(function(c) {
+        c.el.classList.remove('cell-selected');
+        if (c.el._wasProcessed) c.el.classList.add('cell-processed');
+        else if (c.el._wasActualized) c.el.classList.add('cell-actualized');
+        else if (c.el._wasNormal) { /* ничего */ }
+        else c.el.classList.add('cell-changed');
         c.el._wasProcessed = false;
         c.el._wasActualized = false;
         c.el._wasNormal = false;
     });
-    selectedCells = selectedCells.filter(function(c) { return c.sid !== sid; });
+    selectedCells = [];
+    // Выделяем все красные (cell-changed) ячейки во всех разделах
+    document.querySelectorAll('.cell-changed').forEach(function(td) {
+        var addr = td.getAttribute('data-addr');
+        var sid = td.getAttribute('data-sid');
+        if (!addr || !sid) return;
+        td._wasProcessed = false;
+        td._wasActualized = false;
+        td._wasNormal = false;
+        selectedCells.push({addr: addr, sid: sid, el: td});
+        td.classList.remove('cell-changed');
+        td.classList.add('cell-selected');
+    });
     updateSelectedUI();
+}
+
+function cancelSelection(btn) {
+    var sid = btn.getAttribute('data-sid');
+    var sectionCells = selectedCells.filter(function(c) { return c.sid === sid; });
+    if (sectionCells.length === 0) return;
+
+    var addrs = sectionCells.map(function(c) { return c.addr; });
+    var card = btn.closest('.section-card');
+    var pid = card ? card.getAttribute('data-pid') : projectId;
+
+    // Сохраняем на сервер — убираем из списка изменений
+    fetch('/project/' + pid + '/section/' + sid + '/dismiss-changes', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({cells: addrs})
+    }).then(function() {
+        sectionCells.forEach(function(c) {
+            c.el.classList.remove('cell-selected', 'cell-changed', 'cell-processed', 'cell-actualized', 'cell-linkable');
+            c.el._wasProcessed = false;
+            c.el._wasActualized = false;
+            c.el._wasNormal = false;
+        });
+        selectedCells = selectedCells.filter(function(c) { return c.sid !== sid; });
+
+        // Обновляем счётчики
+        var unprocessedEl = document.getElementById('unprocessedCount');
+        if (unprocessedEl) {
+            unprocessedEl.textContent = Math.max(0, parseInt(unprocessedEl.textContent) - addrs.length);
+        }
+        var totalEl = document.querySelector('.stat-num.gray');
+        if (totalEl) {
+            totalEl.textContent = Math.max(0, parseInt(totalEl.textContent) - addrs.length);
+        }
+
+        _updateSectionBadges(sid);
+        updateSelectedUI();
+    });
 }
 
 function markSectionProcessed(btn) {
@@ -1821,7 +1839,10 @@ function _updateSectionBadges(sid) {
 
     if (changedCount > 0) {
         var b = document.createElement('span');
-        b.className = 'badge badge-changes';
+        b.className = 'badge badge-changes badge-changes-click';
+        b.setAttribute('data-sid', sid);
+        b.setAttribute('title', 'Нажмите чтобы выделить все красные');
+        b.onclick = function() { selectSectionChanged(b); };
         b.textContent = changedCount + ' изм.';
         badges.insertBefore(b, insertBefore);
     }
@@ -2009,13 +2030,15 @@ def _schedule_loop():
         _do_auto_check()
 
 
-# Запускаем планировщик при импорте (для gunicorn) и при прямом запуске
-_scheduler_thread = threading.Thread(target=_schedule_loop, daemon=True)
-_scheduler_thread.start()
+# Планировщик запускается только при прямом запуске или gunicorn,
+# но НЕ на serverless (Vercel) — там нет постоянного процесса.
+import os as _os
+if not _os.environ.get("VERCEL"):
+    _scheduler_thread = threading.Thread(target=_schedule_loop, daemon=True)
+    _scheduler_thread.start()
 
 
 if __name__ == "__main__":
-    _migrate_to_single_file()
     # Открываем браузер через 1.5 сек после старта сервера
     threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:5000")).start()
     app.run(host="127.0.0.1", port=5000)
