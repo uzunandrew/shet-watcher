@@ -272,6 +272,55 @@ def section_delete(pid, sid):
     return redirect(url_for("project_view", pid=pid))
 
 
+def _extend_range_rows(range_str: str, n: int) -> str:
+    """Расширяет нижнюю границу каждого под-диапазона на n строк.
+
+    "A8:C24, G8:Y24" + 10 → "A8:C34, G8:Y34"
+    Если в части нет ":" (одна ячейка) — оставляем как есть.
+    """
+    parts = [p.strip() for p in range_str.split(",")]
+    out = []
+    for p in parts:
+        if ":" not in p:
+            out.append(p)
+            continue
+        left, right = p.split(":", 1)
+        m = re.match(r"^([A-Z]+)(\d+)$", right.strip())
+        if not m:
+            out.append(p)
+            continue
+        new_row = int(m.group(2)) + n
+        out.append(f"{left.strip()}:{m.group(1)}{new_row}")
+    return ", ".join(out)
+
+
+@app.route("/project/<pid>/section/<sid>/extend-rows", methods=["POST"])
+def section_extend_rows(pid, sid):
+    """Расширяет диапазон секции на N строк вниз. По умолчанию N=10."""
+    data = request.get_json(silent=True) or {}
+    try:
+        n = int(data.get("rows", 10))
+    except (TypeError, ValueError):
+        n = 10
+    if n <= 0 or n > 1000:
+        return jsonify(ok=False, error="rows должно быть в диапазоне 1..1000")
+
+    cfg = load_config()
+    proj = find_project(cfg, pid)
+    if not proj:
+        return jsonify(ok=False, error="project not found")
+    new_range = None
+    for sec in proj["sections"]:
+        if sec["id"] == sid:
+            new_range = _extend_range_rows(sec["range"], n)
+            sec["range"] = new_range
+            break
+    if new_range is None:
+        return jsonify(ok=False, error="section not found")
+    save_config(cfg)
+    return jsonify(ok=True, range=new_range)
+
+
 @app.route("/project/<pid>/section/<sid>/edit", methods=["POST"])
 def section_edit(pid, sid):
     cfg = load_config()
@@ -1195,6 +1244,19 @@ body {
     transition: all 0.15s;
 }
 .sec-edit-btn:hover { border-color: #7b68ee; color: #aaa; }
+.sec-extend-btn {
+    background: none;
+    border: 1px solid #2a2a4a;
+    color: #888;
+    padding: 3px 10px;
+    border-radius: 4px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+}
+.sec-extend-btn:hover { border-color: #4caf50; color: #81c784; }
+.sec-extend-btn:disabled { opacity: 0.5; cursor: wait; }
 .sec-edit-form {
     display: none;
     padding: 12px 18px;
@@ -1392,6 +1454,9 @@ body {
             <span class="sec-name">{{ sec.name }}</span>
             <span class="sec-meta">{{ sec.range }}</span>
             <button class="sec-edit-btn" onclick="toggleEditForm(this)" title="Редактировать">&#9998;</button>
+            <button class="sec-extend-btn" data-sid="{{ sec.id }}" data-pid="{{ current.id }}"
+                onclick="extendSectionRows(this)"
+                title="Добавить 10 строк к диапазону вниз">+10 строк</button>
             <div class="badges">
                 <button class="badge-processed-btn" data-sid="{{ sec.id }}"
                     onclick="markSectionProcessed(this)">&#10003; Отработано (<span class="sec-sel-cnt">0</span>)</button>
@@ -1591,6 +1656,43 @@ function toggleEditForm(btn) {
     var card = btn.closest('.section-card');
     var form = card.querySelector('.sec-edit-form');
     form.classList.toggle('open');
+}
+
+function extendSectionRows(btn) {
+    var sid = btn.getAttribute('data-sid');
+    var pid = btn.getAttribute('data-pid');
+    if (!sid || !pid) return;
+    btn.disabled = true;
+    var origText = btn.textContent;
+    btn.textContent = '...';
+    fetch('/project/' + pid + '/section/' + sid + '/extend-rows', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({rows: 10}),
+    }).then(function(resp) { return resp.json(); }).then(function(data) {
+        if (!data.ok) {
+            alert('Не удалось расширить диапазон: ' + (data.error || 'неизвестная ошибка'));
+            btn.disabled = false;
+            btn.textContent = origText;
+            return;
+        }
+        // Обновим текст meta-метки сразу, чтобы пользователь видел новое значение,
+        // и форму редактирования. Полная перезагрузка страницы — чтобы свежие
+        // строки появились в таблице после "Проверить все".
+        var card = btn.closest('.section-card');
+        if (card) {
+            var meta = card.querySelector('.sec-meta');
+            if (meta) meta.textContent = data.range;
+            var rangeInput = card.querySelector('.sec-edit-form input[name="range"]');
+            if (rangeInput) rangeInput.value = data.range;
+        }
+        btn.textContent = '+10 строк';
+        btn.disabled = false;
+    }).catch(function(err) {
+        alert('Ошибка сети: ' + err);
+        btn.disabled = false;
+        btn.textContent = origText;
+    });
 }
 
 // ---- Column resize ----
