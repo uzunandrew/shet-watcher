@@ -1501,16 +1501,17 @@ body {
         {% set proc_set = d.get('processed') or [] %}
         {% set act_set = d.get('actualized') or [] %}
         {% set reop_set = d.get('reopened') or [] %}
-        {% set ns.total_changed = ns.total_changed + ch_set|length %}
-        {# processed/actualized/reopened учитываем только если ячейка реально в changed #}
-        {% for a in proc_set if a in ch_set %}{% set ns.total_processed = ns.total_processed + 1 %}{% endfor %}
-        {% for a in act_set if a in ch_set %}{% set ns.total_actualized = ns.total_actualized + 1 %}{% endfor %}
-        {% for a in reop_set if a in ch_set %}{% set ns.total_reopened = ns.total_reopened + 1 %}{% endfor %}
+        {# changed считаем только те, что не помечены proc/act/reop — это реально красные #}
+        {% for a in ch_set if a not in proc_set and a not in act_set and a not in reop_set %}
+            {% set ns.total_changed = ns.total_changed + 1 %}
+        {% endfor %}
+        {% set ns.total_processed = ns.total_processed + proc_set|length %}
+        {% set ns.total_actualized = ns.total_actualized + act_set|length %}
+        {% set ns.total_reopened = ns.total_reopened + reop_set|length %}
     {% endfor %}
-    {% set unprocessed = ns.total_changed - ns.total_processed - ns.total_actualized %}
-    {% if unprocessed < 0 %}{% set unprocessed = 0 %}{% endif %}
+    {% set unprocessed = ns.total_changed + ns.total_reopened %}
 
-    {% if ns.total_changed > 0 %}
+    {% if ns.total_changed > 0 or ns.total_processed > 0 or ns.total_actualized > 0 or ns.total_reopened > 0 %}
     <div class="changes-bar" id="changesBar">
         <div class="stat stat-clickable" onclick="toggleSelectAllBtn()" title="Нажмите чтобы выделить все красные">
             <span class="stat-num red" id="unprocessedCount">{{ unprocessed if unprocessed > 0 else 0 }}</span>
@@ -1602,24 +1603,22 @@ body {
                     <span class="badge badge-changes">ошибка</span>
                 {% elif data.get('first_run') %}
                     <span class="badge badge-first">сохранено</span>
-                {% elif data.get('total', 0) > 0 %}
-                    {% set proc_in_ch = proc|select('in', data.changed)|list %}
-                    {% set act_in_ch = act|select('in', data.changed)|list %}
-                    {% set reop_in_ch = reop|select('in', data.changed)|list %}
-                    {% set unproc = data.changed|reject('in', proc)|reject('in', act)|list|length %}
+                {% elif (data.changed and data.changed|length > 0) or proc|length > 0 or act|length > 0 or reop|length > 0 %}
+                    {% set unproc = (data.changed or [])|reject('in', proc)|reject('in', act)|reject('in', reop)|list|length %}
                     {% if unproc > 0 %}
                         <span class="badge badge-changes badge-changes-click" data-sid="{{ sec.id }}" onclick="selectSectionChanged(this)" title="Нажмите чтобы выделить все красные">{{ unproc }} изм.</span>
-                    {% else %}
+                    {% endif %}
+                    {% if reop|length > 0 %}
+                        <span class="badge badge-reopened" title="Повторное изменение после отработки/актуализации">{{ reop|length }} повт.</span>
+                    {% endif %}
+                    {% if proc|length > 0 %}
+                        <span class="badge badge-ok">{{ proc|length }} отр.</span>
+                    {% endif %}
+                    {% if act|length > 0 %}
+                        <span class="badge badge-actual">{{ act|length }} акт.</span>
+                    {% endif %}
+                    {% if unproc == 0 and proc|length == 0 and act|length == 0 and reop|length == 0 %}
                         <span class="badge badge-ok">OK</span>
-                    {% endif %}
-                    {% if reop_in_ch|length > 0 %}
-                        <span class="badge badge-reopened" title="Повторное изменение после отработки/актуализации">{{ reop_in_ch|length }} повт.</span>
-                    {% endif %}
-                    {% if proc_in_ch|length > 0 %}
-                        <span class="badge badge-ok">{{ proc_in_ch|length }} отр.</span>
-                    {% endif %}
-                    {% if act_in_ch|length > 0 %}
-                        <span class="badge badge-actual">{{ act_in_ch|length }} акт.</span>
                     {% endif %}
                 {% elif data.get('checked_at') %}
                     <span class="badge badge-ok">OK</span>
@@ -1687,19 +1686,19 @@ body {
                             {% set col_letter = data.col_headers[loop.index0] %}
                             {% set is_col_hidden = col_letter in hidden_cols %}
                             {% set is_narrow = col_letter > 'C' and col_letter != '' %}
-                            {% if cell.addr in data.changed and cell.addr in reop %}
+                            {% if cell.addr in reop %}
                             <td class="cell-reopened{{ ' col-narrow' if is_narrow else '' }}{{ ' has-link' if cell.link else '' }}{{ ' col-hidden' if is_col_hidden else '' }}"
                                 data-col="{{ col_letter }}"
                                 data-addr="{{ cell.addr }}" data-sid="{{ sec.id }}"
                                 onclick="toggleCellSelect(this, event)"
                                 title="{{ cell.addr }} — повторное изменение после отработки/актуализации">
-                            {% elif cell.addr in data.changed and cell.addr in act %}
+                            {% elif cell.addr in act %}
                             <td class="cell-actualized{{ ' col-narrow' if is_narrow else '' }}{{ ' has-link' if cell.link else '' }}{{ ' col-hidden' if is_col_hidden else '' }}"
                                 data-col="{{ col_letter }}"
                                 data-addr="{{ cell.addr }}" data-sid="{{ sec.id }}"
                                 onclick="toggleCellSelect(this, event)"
                                 title="{{ cell.addr }} (актуализировано, кликните для смены статуса)">
-                            {% elif cell.addr in data.changed and cell.addr in proc %}
+                            {% elif cell.addr in proc %}
                             <td class="cell-processed{{ ' col-narrow' if is_narrow else '' }}{{ ' has-link' if cell.link else '' }}{{ ' col-hidden' if is_col_hidden else '' }}"
                                 data-col="{{ col_letter }}"
                                 data-addr="{{ cell.addr }}" data-sid="{{ sec.id }}"

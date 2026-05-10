@@ -171,24 +171,86 @@ def _load_marks(mark_type: str) -> dict:
 
 
 def _save_marks(data: dict, mark_type: str) -> None:
-    """Полная перезапись меток одного типа."""
+    """Инкрементальная синхронизация меток одного типа.
+
+    Сравниваем входной dict с тем, что есть в БД. Удаляем только
+    реально пропавшие записи, добавляем только новые. Никогда не
+    делаем глобальный DELETE — иначе пустой/неполный входной dict
+    мог бы стереть все накопленные пользователем отметки.
+    """
     sb = _get_client()
-    # Удаляем все старые метки этого типа
-    sb.table("cell_marks").delete().eq("mark_type", mark_type).execute()
-    # Вставляем новые
-    records = []
+
+    # Что хотим иметь в итоге
+    desired = set()  # {(pid, sid, addr)}
     for composite_key, cells in data.items():
+        if ":" not in composite_key:
+            continue
         pid, sid = composite_key.split(":", 1)
         for addr in cells:
-            records.append({
-                "project_id": pid,
-                "section_id": sid,
-                "cell_address": addr,
-                "mark_type": mark_type,
-            })
-    for i in range(0, len(records), 500):
-        chunk = records[i:i + 500]
-        sb.table("cell_marks").insert(chunk).execute()
+            desired.add((pid, sid, addr))
+
+    # Что сейчас в БД
+    current = set()  # {(pid, sid, addr)}
+    offset = 0
+    page_size = 1000
+    while True:
+        rows = (
+            sb.table("cell_marks")
+            .select("project_id, section_id, cell_address")
+            .eq("mark_type", mark_type)
+            .range(offset, offset + page_size - 1)
+            .execute()
+            .data
+        )
+        for r in rows:
+            current.add((r["project_id"], r["section_id"], r["cell_address"]))
+        if len(rows) < page_size:
+            break
+        offset += page_size
+
+    to_add = desired - current
+    to_remove = current - desired
+
+    # Защита: если входной data полностью пуст, но в БД что-то есть —
+    # это вероятно баг вызывающего кода (передал {} вместо актуального
+    # состояния). Логируем и НЕ стираем.
+    if not data and current:
+        logger.warning(
+            "_save_marks(%s): входной data пустой при %d записей в БД — "
+            "пропускаем destructive remove. Это защита от случайной потери данных.",
+            mark_type, len(current),
+        )
+        to_remove = set()
+
+    # Добавляем новые
+    if to_add:
+        records = [
+            {"project_id": p, "section_id": s, "cell_address": a, "mark_type": mark_type}
+            for (p, s, a) in to_add
+        ]
+        for i in range(0, len(records), 500):
+            chunk = records[i:i + 500]
+            sb.table("cell_marks").insert(chunk).execute()
+
+    # Удаляем пропавшие точечно (по конкретным ключам)
+    if to_remove:
+        # Группируем по (pid, sid) для эффективного DELETE
+        by_section: dict[tuple[str, str], list[str]] = {}
+        for (p, s, a) in to_remove:
+            by_section.setdefault((p, s), []).append(a)
+        for (p, s), addrs in by_section.items():
+            # in_() — Supabase REST поддерживает через "?cell_address=in.(A1,A2)"
+            for i in range(0, len(addrs), 100):
+                chunk = addrs[i:i + 100]
+                (
+                    sb.table("cell_marks")
+                    .delete()
+                    .eq("mark_type", mark_type)
+                    .eq("project_id", p)
+                    .eq("section_id", s)
+                    .in_("cell_address", chunk)
+                    .execute()
+                )
 
 
 def load_processed() -> dict:
@@ -224,8 +286,22 @@ def load_hidden_cols() -> dict:
 
 
 def save_hidden_cols(data: dict) -> None:
-    """Полная перезапись скрытых столбцов."""
+    """Полная перезапись скрытых столбцов.
+
+    Защита: если входной dict пустой — не стираем существующие записи
+    (вероятно вызывающий код передал {} по ошибке).
+    """
     sb = _get_client()
+    if not data:
+        # Сравниваем с тем что в БД. Если БД тоже пуста — ничего не делаем.
+        # Если в БД есть что-то — НЕ удаляем, чтобы избежать случайной потери.
+        existing = sb.table("hidden_columns").select("id").limit(1).execute().data
+        if existing:
+            logger.warning(
+                "save_hidden_cols: входной data пустой при наличии записей в БД — "
+                "пропускаем destructive delete."
+            )
+        return
     sb.table("hidden_columns").delete().gt("id", 0).execute()
     records = []
     for composite_key, cols in data.items():
