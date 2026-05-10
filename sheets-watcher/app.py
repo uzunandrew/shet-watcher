@@ -1744,42 +1744,115 @@ function updateColHideBar(card, sid, pid) {
     }
 }
 
-function toggleCellSelect(td, ev) {
-    if (ev) ev.preventDefault();
-    var addr = td.getAttribute('data-addr');
-    var sid = td.getAttribute('data-sid');
+// Парсер A1-адреса: "A4" -> {col: 1, row: 4}, "AB12" -> {col: 28, row: 12}
+function _parseA1(addr) {
+    var m = /^([A-Z]+)(\d+)$/.exec(addr || '');
+    if (!m) return null;
+    var col = 0;
+    for (var i = 0; i < m[1].length; i++) {
+        col = col * 26 + (m[1].charCodeAt(i) - 64);
+    }
+    return { col: col, row: parseInt(m[2], 10) };
+}
+
+function _selectSingleCell(td) {
     var wasProcessed = td.classList.contains('cell-processed');
     var wasActualized = td.classList.contains('cell-actualized');
     var wasReopened = td.classList.contains('cell-reopened');
     var wasChanged = td.classList.contains('cell-changed');
     var wasNormal = !wasProcessed && !wasChanged && !wasActualized && !wasReopened;
+    td._wasProcessed = wasProcessed;
+    td._wasActualized = wasActualized;
+    td._wasReopened = wasReopened;
+    td._wasNormal = wasNormal;
+    selectedCells.push({
+        addr: td.getAttribute('data-addr'),
+        sid: td.getAttribute('data-sid'),
+        el: td,
+    });
+    td.classList.remove('cell-changed', 'cell-processed', 'cell-actualized', 'cell-reopened', 'cell-linkable');
+    td.classList.add('cell-selected');
+}
+
+function _deselectSingleCell(td, idx) {
+    selectedCells.splice(idx, 1);
+    td.classList.remove('cell-selected');
+    if (td._wasProcessed) td.classList.add('cell-processed');
+    else if (td._wasActualized) td.classList.add('cell-actualized');
+    else if (td._wasReopened) td.classList.add('cell-reopened');
+    else if (td._wasNormal) { /* ничего */ }
+    else td.classList.add('cell-changed');
+    td._wasProcessed = false;
+    td._wasActualized = false;
+    td._wasReopened = false;
+    td._wasNormal = false;
+}
+
+function toggleCellSelect(td, ev) {
+    if (ev) ev.preventDefault();
+    var addr = td.getAttribute('data-addr');
+    var sid = td.getAttribute('data-sid');
+
+    // Shift+клик: расширить выделение прямоугольником от якоря до текущей ячейки.
+    // Якорь — последняя выделенная ячейка в той же секции.
+    if (ev && ev.shiftKey) {
+        var anchor = null;
+        for (var i = selectedCells.length - 1; i >= 0; i--) {
+            if (selectedCells[i].sid === sid) {
+                anchor = selectedCells[i];
+                break;
+            }
+        }
+        if (!anchor) {
+            // Якоря нет — обычное одиночное выделение
+            _selectSingleCell(td);
+            updateSelectedUI();
+            return;
+        }
+        var aPos = _parseA1(anchor.addr);
+        var cPos = _parseA1(addr);
+        if (!aPos || !cPos) {
+            _selectSingleCell(td);
+            updateSelectedUI();
+            return;
+        }
+        var rMin = Math.min(aPos.row, cPos.row);
+        var rMax = Math.max(aPos.row, cPos.row);
+        var colMin = Math.min(aPos.col, cPos.col);
+        var colMax = Math.max(aPos.col, cPos.col);
+
+        var card = td.closest('.section-card');
+        if (!card) return;
+        // Берём только ячейки этой секции с data-addr — это и обычные, и
+        // changed/processed/actualized/reopened, но исключает row-num.
+        var cells = card.querySelectorAll('td[data-addr][data-sid="' + sid + '"]');
+        cells.forEach(function(other) {
+            // Пропускаем скрытые столбцы и временно невидимые в DOM
+            if (other.classList.contains('col-hidden') &&
+                !other.classList.contains('show-hidden-col')) return;
+            var pos = _parseA1(other.getAttribute('data-addr'));
+            if (!pos) return;
+            if (pos.row < rMin || pos.row > rMax) return;
+            if (pos.col < colMin || pos.col > colMax) return;
+            // Уже выделена — не трогаем
+            var alreadyIdx = selectedCells.findIndex(function(c) {
+                return c.sid === sid && c.addr === other.getAttribute('data-addr');
+            });
+            if (alreadyIdx >= 0) return;
+            _selectSingleCell(other);
+        });
+        // Сбрасываем стандартное выделение текста, которое создаёт Shift+клик
+        if (window.getSelection) window.getSelection().removeAllRanges();
+        updateSelectedUI();
+        return;
+    }
+
+    // Обычное одиночное выделение — toggle
     var idx = selectedCells.findIndex(function(c) { return c.addr === addr && c.sid === sid; });
     if (idx >= 0) {
-        selectedCells.splice(idx, 1);
-        td.classList.remove('cell-selected');
-        if (td._wasProcessed) {
-            td.classList.add('cell-processed');
-        } else if (td._wasActualized) {
-            td.classList.add('cell-actualized');
-        } else if (td._wasReopened) {
-            td.classList.add('cell-reopened');
-        } else if (td._wasNormal) {
-            // ничего
-        } else {
-            td.classList.add('cell-changed');
-        }
-        td._wasProcessed = false;
-        td._wasActualized = false;
-        td._wasReopened = false;
-        td._wasNormal = false;
+        _deselectSingleCell(td, idx);
     } else {
-        td._wasProcessed = wasProcessed;
-        td._wasActualized = wasActualized;
-        td._wasReopened = wasReopened;
-        td._wasNormal = wasNormal;
-        selectedCells.push({addr: addr, sid: sid, el: td});
-        td.classList.remove('cell-changed', 'cell-processed', 'cell-actualized', 'cell-reopened', 'cell-linkable');
-        td.classList.add('cell-selected');
+        _selectSingleCell(td);
     }
     updateSelectedUI();
 }
