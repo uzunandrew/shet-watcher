@@ -1,16 +1,6 @@
 {
-  "builds": [
-    {
-      "src": "api/index.py",
-      "use": "@vercel/python",
-      "config": { "maxLambdaSize": "15mb" }
-    }
-  ],
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "api/index.py"
-    }
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api/index" }
   ],
   "functions": {
     "api/index.py": {
@@ -18,9 +8,7 @@
     }
   },
   "crons": [
-    {
-      "path": "/api/cron/auto-check",
-      "schedule": "0 3 * * *"
-    }
+    { "path": "/api/cron/auto-check", "schedule": "0 3 * * *" },
+    { "path": "/api/cron/auto-check", "schedule": "30 3 * * *" }
   ]
 }

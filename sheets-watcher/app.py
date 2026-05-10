@@ -344,11 +344,20 @@ def section_edit(pid, sid):
     return redirect(url_for("project_view", pid=pid))
 
 
-def _run_project_check(client, proj, capture_invalid_url_error: bool = True) -> None:
+def _run_project_check(
+    client,
+    proj,
+    capture_invalid_url_error: bool = True,
+    inter_section_delay: float = 3.0,
+) -> None:
     """Общая бизнес-логика проверки одного проекта.
 
     Используется и ручной (project_check), и фоновой (_do_auto_check) проверкой —
     логика повторного изменения, обновления snapshot и кеша должна быть единой.
+
+    inter_section_delay — пауза между разделами для защиты от rate-limit
+    Google Sheets API. На serverless (cron) можно ставить 0, чтобы уложиться
+    в Vercel maxDuration.
     """
     pid = proj["id"]
     old_snapshot = load_snapshot()
@@ -366,8 +375,8 @@ def _run_project_check(client, proj, capture_invalid_url_error: bool = True) -> 
     actualized_dirty = False
 
     for idx, sec in enumerate(proj["sections"]):
-        if idx > 0:
-            time.sleep(3)  # пауза между разделами для API лимита
+        if idx > 0 and inter_section_delay > 0:
+            time.sleep(inter_section_delay)
         try:
             sp_id, gid = parse_url(sec["url"])
             if not sp_id:
@@ -471,15 +480,66 @@ def project_check(pid):
     return redirect(url_for("project_view", pid=pid))
 
 
+@app.route("/api/cron/check-project/<pid>", methods=["GET", "POST"])
+def cron_check_project(pid):
+    """Проверка ОДНОГО проекта. Удобно вызывать из внешнего планировщика
+    (GitHub Actions cron), который сам обходит все pid'ы по очереди.
+    Это позволяет уложиться в Vercel Hobby maxDuration=60 на каждый проект.
+    """
+    secret = os.environ.get("CRON_SECRET", "")
+    if secret:
+        auth = request.headers.get("Authorization", "")
+        if auth != f"Bearer {secret}":
+            return jsonify(ok=False, error="unauthorized"), 401
+
+    cfg = load_config()
+    proj = find_project(cfg, pid)
+    if not proj:
+        return jsonify(ok=False, error="project not found"), 404
+
+    try:
+        client = get_client()
+    except Exception as e:
+        logger.error("cron check-project %s: get_client failed: %s", pid, e)
+        return jsonify(ok=False, error="sheets auth failed"), 500
+
+    try:
+        _run_project_check(client, proj, inter_section_delay=0)
+    except Exception as e:
+        logger.exception("cron check-project %s: failed: %s", pid, e)
+        return jsonify(ok=False, error=str(e)), 500
+
+    return jsonify(ok=True, project=pid)
+
+
+@app.route("/api/cron/projects", methods=["GET"])
+def cron_list_projects():
+    """Возвращает список project_id для GitHub Actions. Защищён CRON_SECRET."""
+    secret = os.environ.get("CRON_SECRET", "")
+    if secret:
+        auth = request.headers.get("Authorization", "")
+        if auth != f"Bearer {secret}":
+            return jsonify(ok=False, error="unauthorized"), 401
+
+    cfg = load_config()
+    return jsonify(ok=True, projects=[p["id"] for p in cfg.get("projects", [])])
+
+
 @app.route("/api/cron/auto-check", methods=["GET", "POST"])
 def cron_auto_check():
-    """Endpoint для Vercel Cron Jobs. Проверяет все проекты подряд.
+    """Resumable cron: проверяет проекты подряд, начиная с последней точки
+    остановки. Если приближаемся к лимиту времени — сохраняем cursor и
+    выходим. Следующий cron-вызов продолжит с этой точки.
 
-    Защита: если задан CRON_SECRET в env, входящий запрос должен
-    нести Authorization: Bearer <CRON_SECRET>. Vercel Cron Jobs
-    автоматически добавляет этот заголовок, если переменная
-    CRON_SECRET установлена в Project Settings.
+    Cursor хранится в section_cache под ключом '__cron_cursor__'.
+    Защита: CRON_SECRET в Authorization: Bearer.
     """
+    import time as _time
+    started_at = _time.monotonic()
+    # Ниже Vercel hobby maxDuration=60: оставляем запас, чтобы успеть
+    # сохранить cursor и ответить.
+    BUDGET_SECONDS = 50
+
     secret = os.environ.get("CRON_SECRET", "")
     if secret:
         auth = request.headers.get("Authorization", "")
@@ -492,25 +552,68 @@ def cron_auto_check():
         logger.error("cron auto-check: load_config failed: %s", e)
         return jsonify(ok=False, error="config load failed"), 500
 
+    projects = cfg.get("projects", [])
+    if not projects:
+        return jsonify(ok=True, message="no projects")
+
     try:
         client = get_client()
     except Exception as e:
         logger.error("cron auto-check: get_client failed: %s", e)
         return jsonify(ok=False, error="sheets auth failed"), 500
 
-    checked = 0
-    failed = 0
-    for proj in cfg.get("projects", []):
+    sc = load_section_cache()
+    cursor = sc.get("__cron_cursor__", {}) or {}
+    start_idx = int(cursor.get("project_index", 0))
+    if start_idx >= len(projects):
+        start_idx = 0  # обернулись на новый круг
+
+    checked = []
+    failed = []
+    finished = False
+    last_idx = start_idx
+
+    for i in range(start_idx, len(projects)):
+        last_idx = i
+        # Проверяем оставшийся бюджет ДО запуска проверки очередного проекта.
+        # Если осталось меньше времени, чем уйдёт на один проект (~30 сек),
+        # лучше остановиться — пусть следующий cron продолжит.
+        elapsed = _time.monotonic() - started_at
+        if elapsed > BUDGET_SECONDS - 30:
+            break
+
+        proj = projects[i]
         try:
-            _run_project_check(client, proj)
-            checked += 1
+            _run_project_check(client, proj, inter_section_delay=0)
+            checked.append(proj["id"])
         except Exception as e:
-            failed += 1
+            failed.append(proj["id"])
             logger.exception(
                 "cron auto-check: project %s failed: %s", proj.get("id"), e
             )
+    else:
+        # цикл завершился без break = прошли все проекты до конца
+        finished = True
 
-    return jsonify(ok=True, projects_checked=checked, projects_failed=failed)
+    # Сохраняем cursor: либо следующий индекс (если вышли по бюджету),
+    # либо обнуляем (если дошли до конца).
+    sc = load_section_cache()  # перечитываем актуальное состояние
+    if finished:
+        sc.pop("__cron_cursor__", None)
+        next_idx = 0
+    else:
+        next_idx = last_idx  # повторим ту, на которой не хватило времени
+        sc["__cron_cursor__"] = {"project_index": next_idx}
+    save_section_cache(sc)
+
+    return jsonify(
+        ok=True,
+        checked=checked,
+        failed=failed,
+        finished=finished,
+        next_index=next_idx,
+        elapsed=round(_time.monotonic() - started_at, 1),
+    )
 
 
 @app.route("/project/<pid>/section/<sid>/mark-processed", methods=["POST"])
