@@ -2,13 +2,25 @@
   "builds": [
     {
       "src": "api/index.py",
-      "use": "@vercel/python"
+      "use": "@vercel/python",
+      "config": { "maxLambdaSize": "15mb" }
     }
   ],
   "routes": [
     {
       "src": "/(.*)",
       "dest": "api/index.py"
+    }
+  ],
+  "functions": {
+    "api/index.py": {
+      "maxDuration": 60
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/cron/auto-check",
+      "schedule": "0 3 * * *"
     }
   ]
 }

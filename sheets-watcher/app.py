@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import time
 import uuid
@@ -468,6 +469,48 @@ def project_check(pid):
 
     _run_project_check(client, proj)
     return redirect(url_for("project_view", pid=pid))
+
+
+@app.route("/api/cron/auto-check", methods=["GET", "POST"])
+def cron_auto_check():
+    """Endpoint для Vercel Cron Jobs. Проверяет все проекты подряд.
+
+    Защита: если задан CRON_SECRET в env, входящий запрос должен
+    нести Authorization: Bearer <CRON_SECRET>. Vercel Cron Jobs
+    автоматически добавляет этот заголовок, если переменная
+    CRON_SECRET установлена в Project Settings.
+    """
+    secret = os.environ.get("CRON_SECRET", "")
+    if secret:
+        auth = request.headers.get("Authorization", "")
+        if auth != f"Bearer {secret}":
+            return jsonify(ok=False, error="unauthorized"), 401
+
+    try:
+        cfg = load_config()
+    except Exception as e:
+        logger.error("cron auto-check: load_config failed: %s", e)
+        return jsonify(ok=False, error="config load failed"), 500
+
+    try:
+        client = get_client()
+    except Exception as e:
+        logger.error("cron auto-check: get_client failed: %s", e)
+        return jsonify(ok=False, error="sheets auth failed"), 500
+
+    checked = 0
+    failed = 0
+    for proj in cfg.get("projects", []):
+        try:
+            _run_project_check(client, proj)
+            checked += 1
+        except Exception as e:
+            failed += 1
+            logger.exception(
+                "cron auto-check: project %s failed: %s", proj.get("id"), e
+            )
+
+    return jsonify(ok=True, projects_checked=checked, projects_failed=failed)
 
 
 @app.route("/project/<pid>/section/<sid>/mark-processed", methods=["POST"])
@@ -2402,9 +2445,9 @@ def _schedule_loop():
 
 
 # Планировщик запускается только при прямом запуске или gunicorn,
-# но НЕ на serverless (Vercel) — там нет постоянного процесса.
-import os as _os
-if not _os.environ.get("VERCEL"):
+# но НЕ на serverless (Vercel) — там автопроверка делается через Vercel Cron
+# (endpoint /api/cron/auto-check), а постоянного процесса всё равно нет.
+if not os.environ.get("VERCEL"):
     _scheduler_thread = threading.Thread(target=_schedule_loop, daemon=True)
     _scheduler_thread.start()
 
