@@ -527,18 +527,20 @@ def cron_list_projects():
 
 @app.route("/api/cron/auto-check", methods=["GET", "POST"])
 def cron_auto_check():
-    """Resumable cron: проверяет проекты подряд, начиная с последней точки
-    остановки. Если приближаемся к лимиту времени — сохраняем cursor и
-    выходим. Следующий cron-вызов продолжит с этой точки.
+    """Resumable cron. Использует существующий last_check как естественный
+    cursor: проверяет только те проекты, у которых last_check старше
+    текущих суток (UTC). Каждый успешный _run_project_check обновляет
+    last_check, поэтому проект автоматически выпадает из очереди.
 
-    Cursor хранится в section_cache под ключом '__cron_cursor__'.
+    Если за один вызов не успели обойти все — следующий cron продолжит
+    с оставшихся "несвежих" проектов.
+
     Защита: CRON_SECRET в Authorization: Bearer.
     """
     import time as _time
+    from datetime import datetime, timezone, timedelta
     started_at = _time.monotonic()
-    # Ниже Vercel hobby maxDuration=60: оставляем запас, чтобы успеть
-    # сохранить cursor и ответить.
-    BUDGET_SECONDS = 50
+    BUDGET_SECONDS = 50  # запас от 60-сек лимита Vercel Hobby
 
     secret = os.environ.get("CRON_SECRET", "")
     if secret:
@@ -556,33 +558,37 @@ def cron_auto_check():
     if not projects:
         return jsonify(ok=True, message="no projects")
 
+    # Берём only те проекты, у которых last_check не сегодня
+    last_check_map = load_last_check()  # {pid: "DD.MM.YYYY HH:MM"}
+    today_str = datetime.now().strftime("%d.%m.%Y")
+    fresh_today = set()
+    for pid, dt_str in last_check_map.items():
+        if dt_str and dt_str.startswith(today_str):
+            fresh_today.add(pid)
+
+    pending = [p for p in projects if p["id"] not in fresh_today]
+    if not pending:
+        return jsonify(
+            ok=True,
+            message="all projects are fresh",
+            elapsed=round(_time.monotonic() - started_at, 1),
+        )
+
     try:
         client = get_client()
     except Exception as e:
         logger.error("cron auto-check: get_client failed: %s", e)
         return jsonify(ok=False, error="sheets auth failed"), 500
 
-    sc = load_section_cache()
-    cursor = sc.get("__cron_cursor__", {}) or {}
-    start_idx = int(cursor.get("project_index", 0))
-    if start_idx >= len(projects):
-        start_idx = 0  # обернулись на новый круг
-
     checked = []
     failed = []
-    finished = False
-    last_idx = start_idx
 
-    for i in range(start_idx, len(projects)):
-        last_idx = i
-        # Проверяем оставшийся бюджет ДО запуска проверки очередного проекта.
-        # Если осталось меньше времени, чем уйдёт на один проект (~30 сек),
-        # лучше остановиться — пусть следующий cron продолжит.
+    for proj in pending:
         elapsed = _time.monotonic() - started_at
+        # Если осталось меньше ~30 сек до бюджета — выходим, пусть следующий
+        # cron-вызов подхватит остальные проекты.
         if elapsed > BUDGET_SECONDS - 30:
             break
-
-        proj = projects[i]
         try:
             _run_project_check(client, proj, inter_section_delay=0)
             checked.append(proj["id"])
@@ -591,27 +597,12 @@ def cron_auto_check():
             logger.exception(
                 "cron auto-check: project %s failed: %s", proj.get("id"), e
             )
-    else:
-        # цикл завершился без break = прошли все проекты до конца
-        finished = True
-
-    # Сохраняем cursor: либо следующий индекс (если вышли по бюджету),
-    # либо обнуляем (если дошли до конца).
-    sc = load_section_cache()  # перечитываем актуальное состояние
-    if finished:
-        sc.pop("__cron_cursor__", None)
-        next_idx = 0
-    else:
-        next_idx = last_idx  # повторим ту, на которой не хватило времени
-        sc["__cron_cursor__"] = {"project_index": next_idx}
-    save_section_cache(sc)
 
     return jsonify(
         ok=True,
         checked=checked,
         failed=failed,
-        finished=finished,
-        next_index=next_idx,
+        pending_total=len(pending),
         elapsed=round(_time.monotonic() - started_at, 1),
     )
 
