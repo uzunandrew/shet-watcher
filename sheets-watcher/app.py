@@ -413,17 +413,12 @@ def _run_project_check(
                         if was_proc or was_act:
                             reopened_set.add(addr)
 
-            # Гигиена: reopened/proc/act, попавшие в "сироты" (нет в changed),
-            # отфильтровываем — иначе портят счётчики на UI.
-            orig_proc_count = len(proc_set)
-            orig_act_count = len(act_set)
+            # Гигиена: reopened должен быть подмножеством changed
+            # (это пометка повторно-изменённых ячеек). А proc/act НЕ
+            # обязательно в changed: пользователь мог пометить ячейку,
+            # которая физически не менялась — это валидное использование,
+            # просто визуальная метка. Поэтому proc/act не сжимаем.
             reopened_set &= saved_changes
-            proc_set &= saved_changes
-            act_set &= saved_changes
-            if len(proc_set) != orig_proc_count:
-                processed_dirty = True
-            if len(act_set) != orig_act_count:
-                actualized_dirty = True
 
             all_changes[sec_key] = list(saved_changes)
             processed_all[sec_key] = list(proc_set)
