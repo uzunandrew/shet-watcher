@@ -6,5 +6,9 @@
     "api/index.py": {
       "maxDuration": 60
     }
-  }
+  },
+  "crons": [
+    { "path": "/api/cron/auto-check", "schedule": "0 3 * * *" },
+    { "path": "/api/cron/auto-check", "schedule": "30 3 * * *" }
+  ]
 }
